@@ -360,3 +360,480 @@ fn dxf_roundtrips_page_setup() {
     assert_eq!(p.margins_mm, [5.0, 6.0, 7.0, 8.0]);
     assert_eq!(p.paper, a3.name);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Round trips of styles, overrides, associativity, constraints and tables.
+
+fn dim(kind: DimKind, p13: Vec3, p14: Vec3) -> Dimension {
+    Dimension {
+        kind,
+        defpt: Vec3::new(p13.x, p13.y - 2.0, 0.0),
+        text_mid: Vec3::ZERO,
+        p13,
+        p14,
+        p15: Vec3::ZERO,
+        p16: Vec3::ZERO,
+        text: String::new(),
+        style: "Standard".into(),
+        measurement: 0.0,
+        text_rotation: 0.0,
+        user_text_pos: false,
+        block: None,
+        overrides: Default::default(),
+        assoc: Vec::new(),
+    }
+}
+
+fn first<T>(d: &Drawing, f: impl Fn(&EntityKind) -> Option<T>) -> T {
+    d.model.iter().find_map(|e| f(&e.kind)).expect("entity")
+}
+
+fn roundtrip(d: &Drawing) -> Drawing {
+    read_dxf(write_dxf(d).as_bytes()).unwrap()
+}
+
+fn full_dim_style() -> DimStyle {
+    DimStyle {
+        name: "Mech".into(),
+        scale: 2.5,
+        arrow_size: 0.25,
+        ext_offset: 0.1,
+        ext_extend: 0.2,
+        text_height: 0.3,
+        text_gap: 0.05,
+        decimals: 3,
+        angular_decimals: 2,
+        linear_factor: 0.5,
+        text_above: 1,
+        text_inside_horizontal: false,
+        text_outside_horizontal: false,
+        arrow_block: "_ArchTick".into(),
+        tick_size: 0.15,
+        dim_line_color: Color::Index(1),
+        ext_line_color: Color::ByLayer,
+        text_color: Color::Index(5),
+        text_style: "Romans".into(),
+        post: "<> mm".into(),
+        center_mark: -0.1,
+        zero_suppression: 12,
+        linear_unit: 4,
+        tolerance: true,
+        tol_plus: 0.02,
+        tol_minus: 0.01,
+        baseline_spacing: 0.5,
+        annotative: true,
+        arrow_block1: "_DOT".into(),
+        arrow_block2: "_Open".into(),
+        dim_line_extend: 0.125,
+        text_just: 2,
+        round: 0.25,
+        decimal_separator: ",".into(),
+        fraction_format: 1,
+        limits: true,
+        tol_decimals: 2,
+        tol_scale: 0.75,
+        alt: true,
+        alt_factor: 0.03937,
+        alt_decimals: 3,
+        alt_post: "[<>]".into(),
+        angular_unit: 1,
+        suppress_ext1: true,
+        suppress_ext2: true,
+    }
+}
+
+#[test]
+fn dimstyle_roundtrips_every_field() {
+    let mut d = Drawing::new_imperial();
+    d.text_styles.push(TextStyle { name: "Romans".into(), font: "romans.shx".into(), ..TextStyle::default() });
+    d.dim_styles.push(full_dim_style());
+    let text = write_dxf(&d);
+    // Arrowheads are blocks referenced by handle (342/343/344) with DIMSAH set.
+    assert!(text.contains("_ArchTick") && text.contains("_DOT") && text.contains("_Open"));
+    let back = read_dxf(text.as_bytes()).unwrap();
+    assert_eq!(back.dim_style("Mech").unwrap(), &full_dim_style());
+    assert_eq!(back.dim_style("Standard").unwrap(), &DimStyle::default());
+    // Generated arrowhead blocks are not imported as user blocks, so they never pile up.
+    assert!(back.blocks.keys().all(|k| !k.starts_with('_')), "{:?}", back.blocks.keys().collect::<Vec<_>>());
+    let again = roundtrip(&back);
+    assert_eq!(again.dim_styles, back.dim_styles);
+    assert_eq!(write_dxf(&again).matches("AcDbBlockBegin").count(), write_dxf(&back).matches("AcDbBlockBegin").count());
+}
+
+#[test]
+fn user_block_arrowheads_are_referenced_not_regenerated() {
+    let mut d = Drawing::new_imperial();
+    let mut b = Block::new("MyArrow");
+    b.entities.push(Entity::new(Handle(0x60), EntityKind::Circle(Circle { center: Vec3::ZERO, radius: 0.5 })));
+    d.blocks.insert("MyArrow".into(), std::sync::Arc::new(b));
+    d.dim_styles.push(DimStyle { name: "U".into(), arrow_block: "MyArrow".into(), ..DimStyle::default() });
+    let back = roundtrip(&d);
+    assert_eq!(back.dim_style("U").unwrap().arrow_block, "MyArrow");
+    assert!(back.block("MyArrow").is_some());
+    assert_eq!(back.blocks.len(), d.blocks.len());
+}
+
+#[test]
+fn dimension_overrides_roundtrip_as_dstyle_xdata() {
+    let mut d = Drawing::new_imperial();
+    d.text_styles.push(TextStyle { name: "Romans".into(), font: "romans.shx".into(), ..TextStyle::default() });
+    let mut dm = dim(DimKind::Linear { rotation: 0.0 }, Vec3::ZERO, Vec3::new(10.0, 0.0, 0.0));
+    let raw = serde_json::json!({
+        "arrowSize": 0.5,
+        "dimLineColor": 3,
+        "textStyle": "Romans",
+        "arrowBlock1": "_Dot",
+        "arrowBlock": "",
+        "decimalSeparator": ",",
+        "suppressExt1": true,
+        "post": "<> mm",
+        "decimals": 2,
+        "textJust": 1,
+        "altFactor": 25.4,
+    });
+    dm.overrides = raw.as_object().unwrap().clone();
+    d.add(&Space::Model, Common::default(), EntityKind::Dimension(dm.clone())).unwrap();
+    let text = write_dxf(&d);
+    assert!(text.contains("DSTYLE"));
+    let back = read_dxf(text.as_bytes()).unwrap();
+    let got = first(&back, |k| if let EntityKind::Dimension(x) = k { Some(x.clone()) } else { None });
+    // Values come back canonical (colours as colour objects); the effective style is identical.
+    assert_eq!(got.overrides.len(), dm.overrides.len(), "{:?}", got.overrides);
+    let base = DimStyle::default();
+    assert_eq!(base.with_overrides(&got.overrides), base.with_overrides(&dm.overrides));
+    assert_eq!(got.overrides.get("dimLineColor"), Some(&serde_json::to_value(Color::Index(3)).unwrap()));
+    // Canonical values round-trip exactly.
+    let again = first(&roundtrip(&back), |k| if let EntityKind::Dimension(x) = k { Some(x.clone()) } else { None });
+    assert_eq!(again.overrides, got.overrides);
+}
+
+#[test]
+fn dimension_associativity_roundtrips() {
+    let mut d = Drawing::new_imperial();
+    let c = Common::default;
+    let l1 = d.add(&Space::Model, c(), EntityKind::Line(Line { a: Vec3::ZERO, b: Vec3::new(0.0, 5.0, 0.0) })).unwrap();
+    let l2 = d.add(&Space::Model, c(), EntityKind::Line(Line { a: Vec3::new(10.0, 0.0, 0.0), b: Vec3::new(10.0, 5.0, 0.0) })).unwrap();
+    let ci = d.add(&Space::Model, c(), EntityKind::Circle(Circle { center: Vec3::new(20.0, 0.0, 0.0), radius: 2.0 })).unwrap();
+    let pl = d
+        .add(
+            &Space::Model,
+            c(),
+            EntityKind::LwPolyline(LwPolyline {
+                vertices: vec![PolyVertex::new(Vec2::new(30.0, 0.0)), PolyVertex::new(Vec2::new(32.0, 0.0)), PolyVertex::new(Vec2::new(32.0, 3.0))],
+                closed: false,
+                const_width: 0.0,
+                elevation: 0.0,
+                plinegen: false,
+            }),
+        )
+        .unwrap();
+    let mut lin = dim(DimKind::Linear { rotation: 0.0 }, Vec3::ZERO, Vec3::new(10.0, 0.0, 0.0));
+    lin.assoc = vec![
+        DimAssoc { point: "p13".into(), handle: l1, snap: AssocSnap::Start },
+        DimAssoc { point: "p14".into(), handle: l2, snap: AssocSnap::Start },
+    ];
+    let mut ali = dim(DimKind::Aligned, Vec3::new(22.0, 0.0, 0.0), Vec3::new(32.0, 3.0, 0.0));
+    ali.assoc = vec![
+        DimAssoc { point: "p13".into(), handle: ci, snap: AssocSnap::OnCircle { angle: 0.0 } },
+        DimAssoc { point: "p14".into(), handle: pl, snap: AssocSnap::Vertex { index: 2 } },
+        DimAssoc { point: "defpt".into(), handle: l1, snap: AssocSnap::Intersection { other: l2 } },
+    ];
+    let mut rad = dim(DimKind::Radius, Vec3::new(20.0, 0.0, 0.0), Vec3::ZERO);
+    rad.assoc = vec![DimAssoc { point: "defpt".into(), handle: ci, snap: AssocSnap::Center }];
+    let hl = d.add(&Space::Model, c(), EntityKind::Dimension(lin.clone())).unwrap();
+    let ha = d.add(&Space::Model, c(), EntityKind::Dimension(ali.clone())).unwrap();
+    let hr = d.add(&Space::Model, c(), EntityKind::Dimension(rad.clone())).unwrap();
+    let text = write_dxf(&d);
+    assert!(text.contains("DIMASSOC") && text.contains("ACAD_DIMASSOC") && text.contains("AcDbOsnapPointRef"));
+    let back = read_dxf(text.as_bytes()).unwrap();
+    let assoc_of = |d: &Drawing, h: Handle| match &d.entity(h).unwrap().kind {
+        EntityKind::Dimension(x) => x.assoc.clone(),
+        _ => panic!(),
+    };
+    assert_eq!(assoc_of(&back, hl), lin.assoc);
+    assert_eq!(assoc_of(&back, ha), ali.assoc);
+    assert_eq!(assoc_of(&back, hr), rad.assoc);
+    // Entities owning reactors still land in model space.
+    assert_eq!(back.model.len(), d.model.len());
+    assert!(back.layouts.iter().all(|l| l.entities.is_empty()));
+
+    // Without CADCraft's xdata (a file from another writer), the standard DIMASSOC objects
+    // still give the extension-line links.
+    let tags = cadcraft_dxf::parse(text.as_bytes()).unwrap();
+    let mut stripped = Vec::new();
+    let mut skipping = false;
+    for t in tags {
+        if t.code == 1001 {
+            skipping = t.str() == "CADCRAFT";
+        } else if t.code < 1000 {
+            skipping = false;
+        }
+        if !skipping {
+            stripped.push(t);
+        }
+    }
+    let foreign = read_dxf(cadcraft_dxf::write_ascii(&stripped).as_bytes()).unwrap();
+    assert_eq!(assoc_of(&foreign, hl), lin.assoc);
+    let fa = assoc_of(&foreign, ha);
+    assert_eq!(fa.len(), 2);
+    assert_eq!(fa[1], ali.assoc[1]);
+    assert!(matches!(fa[0].snap, AssocSnap::OnCircle { angle } if angle.abs() < 1e-9));
+    assert!(assoc_of(&foreign, hr).is_empty(), "radial links are CADCraft-only");
+}
+
+fn parametric_sample(d: &mut Drawing) -> (Vec<Constraint>, Parametric) {
+    let l1 = d.add(&Space::Model, Common::default(), EntityKind::Line(Line { a: Vec3::ZERO, b: Vec3::new(4.0, 0.0, 0.0) })).unwrap();
+    let l2 = d.add(&Space::Model, Common::default(), EntityKind::Line(Line { a: Vec3::new(4.0, 0.0, 0.0), b: Vec3::new(4.0, 3.0, 0.0) })).unwrap();
+    let constraints = vec![
+        Constraint { id: 1, kind: ConstraintKind::Horizontal, refs: vec![GeomRef::whole(l1)], name: String::new(), expr: String::new() },
+        Constraint {
+            id: 2,
+            kind: ConstraintKind::Coincident,
+            refs: vec![GeomRef::new(l1, Sub::End), GeomRef::new(l2, Sub::Start)],
+            name: String::new(),
+            expr: String::new(),
+        },
+        Constraint {
+            id: 3,
+            kind: ConstraintKind::Distance(DistAxis::Vertical),
+            refs: vec![GeomRef::new(l2, Sub::Start), GeomRef::new(l2, Sub::End)],
+            name: "d1".into(),
+            expr: "width/2 + 1".into(),
+        },
+        Constraint {
+            id: 4,
+            kind: ConstraintKind::Angular,
+            refs: vec![GeomRef::whole(l1), GeomRef::whole(l2)],
+            name: "ang1".into(),
+            expr: "90".into(),
+        },
+        Constraint {
+            id: 5,
+            kind: ConstraintKind::Fix,
+            refs: vec![GeomRef::new(l2, Sub::Vertex(7)), GeomRef::new(l2, Sub::Segment(3))],
+            name: String::new(),
+            expr: String::new(),
+        },
+    ];
+    // Long text (chunk boundaries inside strings, spaces at the edges), backslashes that
+    // would look like DXF `\U+` escapes, and non-ASCII text.
+    let long = format!("  {}  \\U+0041 \\\\ \"quoted\" Ünïcødé ✓ {}  ", "word ".repeat(80), "x".repeat(300));
+    let parametric = Parametric {
+        parameters: vec![
+            Parameter { name: "width".into(), expr: "12.5".into(), description: long },
+            Parameter { name: "h".into(), expr: "width*0.4".into(), description: String::new() },
+        ],
+        settings: ParametricSettings {
+            infer: true,
+            distance_tolerance: 0.125,
+            angle_tolerance: 2.5,
+            auto_types: vec!["Parallel".into(), "Tangent".into()],
+            bars_visible: false,
+            bar_exceptions: vec![l1],
+            dims_visible: false,
+            dim_exceptions: vec![l2],
+            bar_transparency: 30,
+        },
+    };
+    d.constraints = constraints.clone();
+    d.parametric = parametric.clone();
+    (constraints, parametric)
+}
+
+#[test]
+fn constraints_and_parameters_roundtrip_exactly() {
+    let mut d = Drawing::new_imperial();
+    let (constraints, parametric) = parametric_sample(&mut d);
+    let text = write_dxf(&d);
+    assert!(text.contains("CADCRAFT_CONSTRAINTS") && text.contains("XRECORD"));
+    assert!(!text.contains("\\U+0041"), "no DXF unicode escape may appear in the payload");
+    let back = read_dxf(text.as_bytes()).unwrap();
+    assert_eq!(back.constraints, constraints);
+    assert_eq!(back.parametric, parametric);
+    let again = roundtrip(&back);
+    assert_eq!(again.constraints, constraints);
+    assert_eq!(again.parametric, parametric);
+    // Drawings without parametric data carry no record.
+    assert!(!write_dxf(&Drawing::new_imperial()).contains("CADCRAFT_CONSTRAINTS"));
+}
+
+fn table_sample() -> Table {
+    let cell = |t: &str| TableCell { text: t.into(), merged: None };
+    let mut rows = vec![
+        vec![cell("Door schedule"), cell(""), cell("")],
+        vec![cell("Mark"), cell("Size"), cell("Notes")],
+        vec![cell("D1"), cell("900 x 2100"), cell(&"long note ".repeat(40))],
+        vec![cell("D2"), cell("800 x 2100"), cell("")],
+    ];
+    rows[0][0].merged = Some((1, 3));
+    rows[2][0].merged = Some((2, 1));
+    Table {
+        insert: Vec3::new(5.0, 20.0, 0.0),
+        col_widths: vec![1.5, 2.5, 4.0],
+        row_heights: vec![0.5, 0.4, 0.4, 0.4],
+        cells: rows,
+        style: "Schedule".into(),
+        text_height: 0.2,
+        title: true,
+        header: true,
+    }
+}
+
+#[test]
+fn tables_roundtrip_with_title_header_and_merges() {
+    let mut d = Drawing::new_imperial();
+    d.table_styles.push(TableStyle { name: "Schedule".into(), text_height: 0.25, margin: 0.1, title: false, header: true });
+    let t = table_sample();
+    d.add(&Space::Model, Common::default(), EntityKind::Table(t.clone())).unwrap();
+    let text = write_dxf(&d);
+    assert!(text.contains("ACAD_TABLE") && text.contains("TABLESTYLE") && text.contains("*T1"));
+    let back = read_dxf(text.as_bytes()).unwrap();
+    let got = first(&back, |k| if let EntityKind::Table(x) = k { Some(x.clone()) } else { None });
+    assert_eq!(got, t);
+    assert_eq!(back.table_styles, d.table_styles);
+    assert!(back.block("*T1").is_none(), "table blocks are regenerated, not imported");
+    let again = roundtrip(&back);
+    assert_eq!(first(&again, |k| if let EntityKind::Table(x) = k { Some(x.clone()) } else { None }), t);
+    assert_eq!(again.blocks.len(), back.blocks.len());
+}
+
+#[test]
+fn text_style_flags_roundtrip() {
+    let mut d = Drawing::new_imperial();
+    let st = TextStyle {
+        name: "Mirror".into(),
+        font: "romans.shx".into(),
+        big_font: "bigfont.shx".into(),
+        height: 0.0,
+        width_factor: 0.8,
+        oblique: 15f64.to_radians(),
+        backwards: true,
+        upside_down: true,
+        vertical: true,
+        annotative: true,
+    };
+    d.text_styles.push(st.clone());
+    d.text_styles.push(TextStyle { name: "Plain".into(), font: "arial.ttf".into(), backwards: true, ..TextStyle::default() });
+    let back = roundtrip(&d);
+    let got = back.text_style("Mirror").unwrap();
+    assert_eq!((got.backwards, got.upside_down, got.vertical, got.annotative), (true, true, true, true));
+    assert_eq!(got.big_font, "bigfont.shx");
+    assert!((got.oblique - st.oblique).abs() < 1e-12);
+    let plain = back.text_style("Plain").unwrap();
+    assert_eq!((plain.backwards, plain.upside_down, plain.vertical, plain.annotative), (true, false, false, false));
+}
+
+#[test]
+fn hostile_extension_data_never_panics() {
+    let ent = |body: &str| format!("0\nSECTION\n2\nENTITIES\n{body}0\nENDSEC\n0\nEOF\n");
+    let obj = |body: &str| format!("0\nSECTION\n2\nOBJECTS\n{body}0\nENDSEC\n0\nEOF\n");
+    let cases = [
+        // DSTYLE: unbalanced, odd counts, unknown codes, huge values, bad handles.
+        ent("0\nDIMENSION\n5\nA0\n70\n0\n1001\nACAD\n1000\nDSTYLE\n1002\n{\n1070\n"),
+        ent("0\nDIMENSION\n70\n0\n1001\nACAD\n1000\nDSTYLE\n1002\n{\n1070\n40\n1000\nnot a number\n1070\n271\n1070\n32767\n1070\n342\n1005\nZZZZ\n1070\n278\n1070\n-5\n1070\n176\n1070\n-32000\n1070\n9999\n1040\n1e308\n1002\n}\n"),
+        ent("0\nDIMENSION\n70\n0\n1001\nACAD\n1000\nDSTYLE\n1002\n}\n1002\n{\n1002\n{\n"),
+        // ASSOC: malformed links, missing handles, huge vertex index, nested braces.
+        ent("0\nDIMENSION\n70\n1\n1001\nCADCRAFT\n1000\nASSOC\n1002\n{\n1002\n{\n1000\np13\n1070\n6\n1071\n-1\n1002\n}\n1002\n{\n1000\nbogus\n1005\n1\n1070\n0\n1002\n}\n1002\n{\n1000\np14\n1005\nFFFFFFFFFFFFFFFFFFFF\n1070\n4\n1002\n}\n1002\n{\n1000\np14\n1005\n2A\n1070\n6\n1071\n2147483647\n1002\n}\n"),
+        ent("0\nDIMENSION\n70\n0\n1001\nCADCRAFT\n1000\nASSOC\n1002\n{\n1002\n{\n1002\n{\n1002\n{\n"),
+        // Tables: enormous or negative counts, cells without bodies, spans past the edge.
+        ent("0\nACAD_TABLE\n2\n*T1\n100\nAcDbTable\n91\n999999999\n92\n999999999\n171\n1\n0\nACAD_TABLE\n100\nAcDbTable\n91\n-4\n92\n3\n171\n"),
+        ent("0\nACAD_TABLE\n100\nAcDbTable\n91\n2\n92\n2\n141\nnan\n142\n-1\n171\n1\n173\n1\n175\n99999\n176\n-3\n1\nx\n171\n171\n171\n171\n171\n2\nzzz\n1001\nCADCRAFT\n1000\nTABLE\n1040\n-1\n"),
+        // DIMASSOC pointing at nothing, or at a non-dimension.
+        format!(
+            "{}{}",
+            "0\nSECTION\n2\nENTITIES\n0\nLINE\n5\n10\n10\n0\n20\n0\n11\n1\n21\n0\n0\nDIMENSION\n5\n11\n70\n0\n0\nENDSEC\n",
+            "0\nSECTION\n2\nOBJECTS\n0\nDIMASSOC\n100\nAcDbDimAssoc\n330\n11\n90\n-1\n1\nAcDbOsnapPointRef\n72\n1\n331\n10\n1\nAcDbOsnapPointRef\n72\n6\n331\n10\n332\n99\n1\n1\n1\n0\nDIMASSOC\n100\nAcDbDimAssoc\n330\n10\n90\n3\n0\nDIMASSOC\n0\nENDSEC\n0\nEOF\n"
+        ),
+        // Constraint record: garbage, wrong version, deep nesting, unterminated.
+        obj("0\nDICTIONARY\n5\nC\n3\nCADCRAFT_CONSTRAINTS\n350\nD\n0\nXRECORD\n5\nD\n1\n{\"version\":1,\"constraints\":[{\"id\":1,\"kind\":\"nope\"}]}\n"),
+        obj(&format!("0\nDICTIONARY\n3\nCADCRAFT_CONSTRAINTS\n350\nD\n0\nXRECORD\n5\nD\n1\n{}\n", "[".repeat(5000))),
+        obj("0\nDICTIONARY\n3\nCADCRAFT_CONSTRAINTS\n350\nD\n3\nX\n0\nXRECORD\n5\nD\n1\n{\"version\":99}\n"),
+        obj("0\nDICTIONARY\n3\nCADCRAFT_CONSTRAINTS\n0\nXRECORD\n1\n{\"version\":1,\n"),
+        // Table styles with junk numbers; DIMSTYLE with junk and dangling handles.
+        obj("0\nDICTIONARY\n3\nS\n350\nE\n0\nTABLESTYLE\n5\nE\n40\n-7\n140\n0\n280\n9\n"),
+        "0\nSECTION\n2\nTABLES\n0\nTABLE\n2\nDIMSTYLE\n0\nDIMSTYLE\n2\nX\n271\n99999\n340\nBAD\n342\n0\n343\nFFFF\n176\n70000\n278\n0\n278\n1114112\n77\n-1\n1001\nAcadAnnotative\n1000\nAnnotativeData\n1002\n{\n0\nSTYLE\n2\nS\n70\n-1\n71\n99999\n0\nENDTAB\n0\nENDSEC\n0\nEOF\n".to_string(),
+    ];
+    for t in &cases {
+        if let Ok(d) = read(t.as_bytes(), "x.dxf") {
+            let _ = cadcraft_render::build(&d, &Space::Model, &cadcraft_render::Options::default());
+            let _ = write_dxf(&d);
+        }
+    }
+    // Huge but well-formed override lists are capped, not trusted.
+    let mut big = String::from("0\nSECTION\n2\nENTITIES\n0\nDIMENSION\n70\n0\n1001\nACAD\n1000\nDSTYLE\n1002\n{\n");
+    for _ in 0..50_000 {
+        big.push_str("1070\n41\n1040\n0.5\n");
+    }
+    big.push_str("1002\n}\n0\nENDSEC\n0\nEOF\n");
+    let d = read(big.as_bytes(), "x.dxf").unwrap();
+    let dm = first(&d, |k| if let EntityKind::Dimension(x) = k { Some(x.clone()) } else { None });
+    assert_eq!(dm.overrides.len(), 1);
+}
+
+/// Everything above in one drawing (also used for external validation).
+fn extension_sample() -> Drawing {
+    let mut d = sample();
+    d.text_styles.push(TextStyle { name: "Romans".into(), font: "romans.shx".into(), backwards: true, annotative: true, ..TextStyle::default() });
+    d.dim_styles.push(full_dim_style());
+    d.table_styles.push(TableStyle { name: "Schedule".into(), text_height: 0.25, margin: 0.1, title: true, header: true });
+    d.add(&Space::Model, Common::default(), EntityKind::Table(table_sample())).unwrap();
+    let l1 = d.add(&Space::Model, Common::default(), EntityKind::Line(Line { a: Vec3::new(0.0, 30.0, 0.0), b: Vec3::new(0.0, 35.0, 0.0) })).unwrap();
+    let l2 = d.add(&Space::Model, Common::default(), EntityKind::Line(Line { a: Vec3::new(8.0, 30.0, 0.0), b: Vec3::new(8.0, 35.0, 0.0) })).unwrap();
+    let mut dm = dim(DimKind::Linear { rotation: 0.0 }, Vec3::new(0.0, 30.0, 0.0), Vec3::new(8.0, 30.0, 0.0));
+    dm.style = "Mech".into();
+    dm.assoc = vec![
+        DimAssoc { point: "p13".into(), handle: l1, snap: AssocSnap::Start },
+        DimAssoc { point: "p14".into(), handle: l2, snap: AssocSnap::Start },
+    ];
+    dm.overrides = serde_json::json!({"arrowBlock2": "_BoxFilled", "textColor": 2, "decimals": 1}).as_object().unwrap().clone();
+    d.add(&Space::Model, Common::default(), EntityKind::Dimension(dm)).unwrap();
+    let ci = d.add(&Space::Model, Common::default(), EntityKind::Circle(Circle { center: Vec3::new(20.0, 30.0, 0.0), radius: 2.0 })).unwrap();
+    let mut al = dim(DimKind::Aligned, Vec3::new(22.0, 30.0, 0.0), Vec3::new(8.0, 35.0, 0.0));
+    al.assoc = vec![
+        DimAssoc { point: "p13".into(), handle: ci, snap: AssocSnap::OnCircle { angle: 0.0 } },
+        DimAssoc { point: "p14".into(), handle: l2, snap: AssocSnap::Intersection { other: l1 } },
+    ];
+    d.add(&Space::Model, Common::default(), EntityKind::Dimension(al)).unwrap();
+    parametric_sample(&mut d);
+    d
+}
+
+#[test]
+fn extension_sample_roundtrips_and_can_be_exported() {
+    let d = extension_sample();
+    let text = write_dxf(&d);
+    if let Ok(path) = std::env::var("CADCRAFT_DXF_OUT") {
+        std::fs::write(path, &text).unwrap();
+    }
+    let back = read_dxf(text.as_bytes()).unwrap();
+    assert_eq!(back.model.len(), d.model.len());
+    assert_eq!(back.constraints, d.constraints);
+    assert_eq!(back.dim_style("Mech"), d.dim_style("Mech"));
+    let kinds = |d: &Drawing| d.model.iter().map(|e| e.kind.type_name()).collect::<Vec<_>>();
+    assert_eq!(kinds(&back), kinds(&d));
+}
+
+/// DXF → DWG (acadrust) → DXF keeps what the DWG bridge supports: dimension styles with
+/// arrow blocks, override and associativity xdata, the constraint XRECORD, tables and text
+/// style flags. (TABLESTYLE objects do not survive the bridge.)
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn dwg_roundtrip_keeps_extension_data() {
+    let d = extension_sample();
+    let back = read(&write(&d, "x.dwg").unwrap(), "x.dwg").unwrap();
+    assert_eq!(back.dim_style("Mech"), d.dim_style("Mech"));
+    assert_eq!(back.constraints, d.constraints);
+    assert_eq!(back.parametric, d.parametric);
+    let dims =
+        |d: &Drawing| d.model.iter().filter_map(|e| if let EntityKind::Dimension(x) = &e.kind { Some(x.clone()) } else { None }).collect::<Vec<_>>();
+    let (a, b) = (dims(&d), dims(&back));
+    assert_eq!(a.len(), b.len());
+    for (x, y) in a.iter().zip(&b) {
+        assert_eq!(x.assoc, y.assoc);
+        let st = DimStyle::default();
+        assert_eq!(st.with_overrides(&x.overrides), st.with_overrides(&y.overrides));
+    }
+    assert_eq!(first(&back, |k| if let EntityKind::Table(x) = k { Some(x.clone()) } else { None }), table_sample());
+    let r = back.text_style("Romans").unwrap();
+    assert!(r.backwards && r.annotative);
+}

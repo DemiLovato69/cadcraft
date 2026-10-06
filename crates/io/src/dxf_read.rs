@@ -279,6 +279,7 @@ fn entity(kind: &str, tags: &[Tag]) -> Option<(Common, EntityKind)> {
         }
         "3DFACE" => EntityKind::Face3d(Face3d { corners: [t.p(10), t.p(11), t.p(12), t.p(13)], hidden_edges: t.i(70).unwrap_or(0) as u8 }),
         "HATCH" => hatch(tags, &t)?,
+        "ACAD_TABLE" => EntityKind::Table(acad_table(tags)),
         "VIEWPORT" => EntityKind::Viewport(Viewport {
             center: t.p(10),
             width: t.fd(40, 1.0),
@@ -305,6 +306,71 @@ fn entity(kind: &str, tags: &[Tag]) -> Option<(Common, EntityKind)> {
         }),
     };
     Some((c, k))
+}
+
+/// An ACAD_TABLE entity: sizes, cell texts and merges (DXF Reference), plus CADCraft's
+/// title/header flags, text height and style name from xdata when present.
+fn acad_table(tags: &[Tag]) -> Table {
+    const MAX_CELLS: usize = 1_000_000;
+    let start = tags.iter().position(|x| x.code == 100 && x.str() == "AcDbTable").unwrap_or(0);
+    let tail = tags.get(start..).unwrap_or(&[]);
+    let first_cell = tail.iter().position(|x| x.code == 171).unwrap_or(tail.len());
+    let head = T(tail.get(..first_cell).unwrap_or(&[]));
+    let mut rows = usize::try_from(head.i(91).unwrap_or(0)).unwrap_or(0).min(10_000);
+    let mut cols = usize::try_from(head.i(92).unwrap_or(0)).unwrap_or(0).min(10_000);
+    // Large declared sizes must be backed by cell records (no allocation from a bare count).
+    let n_cells = tail.iter().filter(|x| x.code == 171).count();
+    let declared = rows.saturating_mul(cols);
+    if declared > MAX_CELLS || (declared > 10_000 && n_cells < declared) {
+        rows = 0;
+        cols = 0;
+    }
+    let size = |v: f64| if v.is_finite() && v > 0.0 { v } else { 0.27 };
+    let mut row_heights: Vec<f64> = head.all_f(141).into_iter().take(rows).map(size).collect();
+    row_heights.resize(rows, 0.27);
+    let mut col_widths: Vec<f64> = head.all_f(142).into_iter().take(cols).map(size).collect();
+    col_widths.resize(cols, 2.5);
+    // Cells, row-major, each starting at a 171 group; xdata ends the last one.
+    let body = tail.get(first_cell..).unwrap_or(&[]);
+    let body = body.get(..body.iter().position(|x| x.code >= 1000).unwrap_or(body.len())).unwrap_or(&[]);
+    let mut flat: Vec<TableCell> = Vec::new();
+    let mut i = 0;
+    while let Some(t0) = body.get(i) {
+        if flat.len() >= rows * cols {
+            break;
+        }
+        i += 1;
+        if t0.code != 171 {
+            continue;
+        }
+        let end = body.get(i..).and_then(|r| r.iter().position(|x| x.code == 171)).map(|p| i + p).unwrap_or(body.len());
+        let cell = body.get(i..end).unwrap_or(&[]);
+        i = end;
+        let c = T(cell);
+        let mut text: String = cell.iter().filter(|x| x.code == 2 || x.code == 3).map(Tag::str).collect();
+        text.push_str(&c.s(1).unwrap_or_default());
+        let span = |code: i32| c.i(code).and_then(|v| u32::try_from(v).ok());
+        let merged = match (c.i(173).unwrap_or(0) != 0, span(176), span(175)) {
+            (true, Some(rs), Some(cs)) if rs >= 1 && cs >= 1 && (rs, cs) != (1, 1) => Some((rs, cs)),
+            _ => None,
+        };
+        flat.push(TableCell { text, merged });
+    }
+    flat.resize(rows * cols, TableCell { text: String::new(), merged: None });
+    let cells: Vec<Vec<TableCell>> = if cols == 0 { vec![Vec::new(); rows] } else { flat.chunks(cols).map(<[TableCell]>::to_vec).collect() };
+    let x = crate::dxf_ext::xdata(tags, crate::dxf_ext::APP);
+    let ours = x.iter().position(|t| t.code == 1000 && t.str() == "TABLE").map(|p| x.get(p + 1..).unwrap_or(&[]));
+    let (title, header, text_height, style) = match ours {
+        Some(o) => {
+            let flags: Vec<i64> = o.iter().filter(|t| t.code == 1070).map(Tag::i64).collect();
+            let h = o.iter().find(|t| t.code == 1040).map(Tag::f64).filter(|h| h.is_finite() && *h > 0.0).unwrap_or(0.18);
+            let style = o.iter().find(|t| t.code == 1000).map(Tag::str).unwrap_or_else(|| "Standard".into());
+            (flags.first().is_some_and(|v| *v != 0), flags.get(1).is_some_and(|v| *v != 0), h, style)
+        }
+        // Other writers: a first row merged across every column reads as a title.
+        None => (cols > 1 && cells.first().and_then(|r| r.first()).and_then(|c| c.merged) == Some((1, cols as u32)), false, 0.18, "Standard".into()),
+    };
+    Table { insert: T(tags).p(10), col_widths, row_heights, cells, style, text_height, title, header }
 }
 
 fn hatch(tags: &[Tag], t: &T) -> Option<EntityKind> {
@@ -445,13 +511,53 @@ fn hatch(tags: &[Tag], t: &T) -> Option<EntityKind> {
     }))
 }
 
+/// Handle maps and references gathered while reading.
+#[derive(Default)]
+struct Rx {
+    /// STYLE record handle (upper case) → text style name.
+    styles: HashMap<String, String>,
+    /// BLOCK_RECORD handle (upper case) → block name.
+    brs: HashMap<String, String>,
+    /// Upper-case names of anonymous `*T` blocks drawn by ACAD_TABLE entities.
+    table_blocks: std::collections::HashSet<String>,
+    /// Upper-case block names used by INSERTs.
+    inserted: std::collections::HashSet<String>,
+    /// Tables whose style is known only by TABLESTYLE handle: (table, style handle).
+    table_style_fix: Vec<(Handle, String)>,
+}
+
+/// Dimension overrides and associativity, table references: data of an entity record that
+/// needs the file's handle maps.
+fn entity_extras(kind: &str, tags: &[Tag], h: Handle, k: &mut EntityKind, rx: &mut Rx) {
+    match (kind, k) {
+        ("DIMENSION", EntityKind::Dimension(dm)) => {
+            dm.overrides = crate::dxf_ext::read_dstyle(tags, &rx.styles, &rx.brs);
+            dm.assoc = crate::dxf_ext::read_assoc(tags);
+        }
+        ("ACAD_TABLE", EntityKind::Table(_)) => {
+            let t = T(tags);
+            if let Some(b) = t.s(2) {
+                rx.table_blocks.insert(b.to_ascii_uppercase());
+            }
+            let ours = crate::dxf_ext::xdata(tags, crate::dxf_ext::APP).iter().any(|t| t.code == 1000 && t.str() == "TABLE");
+            if !ours && let Some(sh) = t.s(342) {
+                rx.table_style_fix.push((h, sh.trim().to_ascii_uppercase()));
+            }
+        }
+        ("INSERT", EntityKind::Insert(ins)) => {
+            rx.inserted.insert(ins.block.to_ascii_uppercase());
+        }
+        _ => {}
+    }
+}
+
 /// Parse a run of entity records (ENTITIES section or a block's body) into entities.
-fn parse_entities(recs: &[(String, Vec<Tag>)], d: &mut Drawing) -> Vec<(Option<String>, bool, Entity)> {
+fn parse_entities(recs: &[(String, Vec<Tag>)], d: &mut Drawing, rx: &mut Rx) -> Vec<(Option<String>, bool, Entity)> {
     let mut out = Vec::new();
     let mut i = 0;
     while let Some((kind, tags)) = recs.get(i) {
         let t = T(tags);
-        let owner = t.s(330);
+        let owner = crate::dxf_ext::owner(tags);
         let paper = t.i(67) == Some(1);
         let handle = t.s(5).and_then(|h| Handle::parse_hex(&h));
         let mut kindent = entity(kind, tags);
@@ -517,7 +623,7 @@ fn parse_entities(recs: &[(String, Vec<Tag>)], d: &mut Drawing) -> Vec<(Option<S
             "SEQEND" | "VERTEX" | "ATTRIB" => continue,
             _ => {}
         }
-        if let Some((c, k)) = kindent {
+        if let Some((c, mut k)) = kindent {
             let h = match handle {
                 Some(h) => {
                     d.bump_handseed(h);
@@ -525,6 +631,7 @@ fn parse_entities(recs: &[(String, Vec<Tag>)], d: &mut Drawing) -> Vec<(Option<S
                 }
                 None => d.new_handle(),
             };
+            entity_extras(kind, tags, h, &mut k, rx);
             out.push((owner, paper, Entity { handle: h, common: c, kind: k }));
         }
     }
@@ -571,8 +678,29 @@ fn header(tags: &[Tag], d: &mut Drawing) {
     }
 }
 
-fn tables(tags: &[Tag], d: &mut Drawing, block_records: &mut HashMap<String, String>) {
-    for (kind, tg) in records(tags) {
+/// True when a style record carries `AcadAnnotative` xdata with the annotative flag set.
+fn annotative(tags: &[Tag]) -> bool {
+    let list = crate::dxf_ext::xdata_list(crate::dxf_ext::xdata(tags, "AcadAnnotative"), "AnnotativeData");
+    list.iter().filter(|t| t.code == 1070).nth(1).is_some_and(|t| t.i64() != 0)
+}
+
+fn tables(tags: &[Tag], d: &mut Drawing, rx: &mut Rx) {
+    let recs = records(tags);
+    // Handle maps first: DIMSTYLE records refer to text styles and arrow blocks by handle.
+    for (kind, tg) in &recs {
+        let t = T(tg);
+        let (Some(h), Some(n)) = (t.s(5), t.s(2)) else { continue };
+        match kind.as_str() {
+            "STYLE" => {
+                rx.styles.insert(h.trim().to_ascii_uppercase(), n);
+            }
+            "BLOCK_RECORD" => {
+                rx.brs.insert(h.trim().to_ascii_uppercase(), n);
+            }
+            _ => {}
+        }
+    }
+    for (kind, tg) in recs {
         let t = T(&tg);
         match kind.as_str() {
             "LAYER" => {
@@ -614,6 +742,8 @@ fn tables(tags: &[Tag], d: &mut Drawing, block_records: &mut HashMap<String, Str
                 if name.is_empty() {
                     continue;
                 }
+                // 70 bit 4: vertical; 71 bits 2/4: backwards / upside down.
+                let gen_flags = t.i(71).unwrap_or(0);
                 let st = TextStyle {
                     name: name.clone(),
                     font: t.s(3).unwrap_or_default(),
@@ -621,7 +751,10 @@ fn tables(tags: &[Tag], d: &mut Drawing, block_records: &mut HashMap<String, Str
                     height: t.fd(40, 0.0),
                     width_factor: t.fd(41, 1.0),
                     oblique: t.fd(50, 0.0).to_radians(),
-                    ..Default::default()
+                    backwards: gen_flags & 2 != 0,
+                    upside_down: gen_flags & 4 != 0,
+                    vertical: t.i(70).unwrap_or(0) & 4 != 0,
+                    annotative: annotative(&tg),
                 };
                 match d.text_styles.iter_mut().find(|s| s.name.eq_ignore_ascii_case(&name)) {
                     Some(x) => *x = st,
@@ -633,31 +766,20 @@ fn tables(tags: &[Tag], d: &mut Drawing, block_records: &mut HashMap<String, Str
                 if name.is_empty() {
                     continue;
                 }
-                let def = DimStyle::default();
-                let st = DimStyle {
-                    name: name.clone(),
-                    scale: t.fd(40, 1.0),
-                    arrow_size: t.fd(41, def.arrow_size),
-                    ext_offset: t.fd(42, def.ext_offset),
-                    ext_extend: t.fd(44, def.ext_extend),
-                    text_height: t.fd(140, def.text_height),
-                    tick_size: t.fd(142, 0.0),
-                    linear_factor: t.fd(144, 1.0),
-                    text_gap: t.fd(147, def.text_gap),
-                    text_above: t.i(77).unwrap_or(0) as u8,
-                    decimals: t.i(271).unwrap_or(4).clamp(0, 8) as u8,
-                    zero_suppression: t.i(78).unwrap_or(0) as u8,
-                    post: t.s(3).unwrap_or_default(),
-                    ..def
-                };
+                // Every variable with a DIMSTYLE group code; values the style can't take are
+                // left at their defaults.
+                let mut fields = serde_json::Map::new();
+                for tag in tg.iter().take_while(|x| x.code < 1000) {
+                    let Some((field, kind)) = crate::dxf_ext::dim_field(tag.code) else { continue };
+                    if let Some(v) = crate::dxf_ext::decode(kind, tag, &rx.styles, &rx.brs) {
+                        fields.insert(field.to_string(), v);
+                    }
+                }
+                let mut st = DimStyle { name: name.clone(), annotative: annotative(&tg), ..DimStyle::default() };
+                st.apply_fields(&fields);
                 match d.dim_styles.iter_mut().find(|s| s.name.eq_ignore_ascii_case(&name)) {
                     Some(x) => *x = st,
                     None => d.dim_styles.push(st),
-                }
-            }
-            "BLOCK_RECORD" => {
-                if let (Some(h), Some(n)) = (t.s(5), t.s(2)) {
-                    block_records.insert(h.to_ascii_uppercase(), n);
                 }
             }
             _ => {}
@@ -674,14 +796,15 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
     }
     let mut d = Drawing::new_imperial();
     d.layouts.clear();
-    let mut block_records: HashMap<String, String> = HashMap::new();
+    let mut rx = Rx::default();
     let mut blocks: Vec<(String, Vec3, Vec<(Option<String>, bool, Entity)>, bool)> = Vec::new();
     let mut layout_objs: Vec<(String, u32, String, PageSetup)> = Vec::new();
     let mut entities = Vec::new();
+    let mut objs = Objects::default();
     for s in &secs {
         match s.name.as_str() {
             "HEADER" => header(&s.tags, &mut d),
-            "TABLES" => tables(&s.tags, &mut d, &mut block_records),
+            "TABLES" => tables(&s.tags, &mut d, &mut rx),
             "BLOCKS" => {
                 let recs = records(&s.tags);
                 let mut i = 0;
@@ -696,7 +819,7 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
                             j += 1;
                         }
                         let body = recs.get(i + 1..j).unwrap_or(&[]);
-                        let ents = parse_entities(body, &mut d);
+                        let ents = parse_entities(body, &mut d, &mut rx);
                         blocks.push((name, base, ents, xref));
                         i = j + 1;
                     } else {
@@ -704,9 +827,10 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
                     }
                 }
             }
-            "ENTITIES" => entities = parse_entities(&records(&s.tags), &mut d),
+            "ENTITIES" => entities = parse_entities(&records(&s.tags), &mut d, &mut rx),
             "OBJECTS" => {
                 for (k, tg) in records(&s.tags) {
+                    objs.add(&k, &tg);
                     if k == "LAYOUT" {
                         // Fields after the AcDbLayout marker (AcDbPlotSettings also has a code 1).
                         let start = tg.iter().position(|x| x.code == 100 && x.str() == "AcDbLayout").unwrap_or(0);
@@ -730,7 +854,7 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
             continue;
         }
         d.layouts.push(Layout { page: page.clone(), ..Layout::new(name, *order) });
-        if let Some(bname) = block_records.get(br) {
+        if let Some(bname) = rx.brs.get(br) {
             paper_block_for.insert(bname.to_ascii_uppercase(), name.clone());
         }
     }
@@ -758,6 +882,11 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
             }
             continue;
         }
+        // Generated geometry we rebuild on save: table blocks, and standard arrowhead blocks
+        // nothing inserts.
+        if rx.table_blocks.contains(&up) || (crate::dxf_ext::is_standard_arrow(&name) && !rx.inserted.contains(&up)) {
+            continue;
+        }
         let mut b = Block::new(&name);
         b.base = base;
         if xref {
@@ -771,7 +900,7 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
     // ENTITIES section: model space, or paper space when flagged (67=1).
     for (owner, paper, e) in entities {
         d.ensure_layer(&e.common.layer);
-        let owner_name = owner.and_then(|o| block_records.get(&o.to_ascii_uppercase()).cloned()).map(|n| n.to_ascii_uppercase());
+        let owner_name = owner.and_then(|o| rx.brs.get(&o.trim().to_ascii_uppercase()).cloned()).map(|n| n.to_ascii_uppercase());
         let to_paper = paper || owner_name.as_deref().is_some_and(|n| n.starts_with("*PAPER_SPACE"));
         if to_paper {
             let lname = owner_name.and_then(|n| paper_block_for.get(&n).cloned()).unwrap_or_else(|| first_layout.clone());
@@ -782,6 +911,7 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
             d.model.push(e);
         }
     }
+    objs.apply(&mut d, &rx);
     // Keep handles unique against the header's seed.
     let seed = d.header.str("HANDSEED", "");
     if let Some(h) = Handle::parse_hex(&seed) {
@@ -791,6 +921,176 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
         d.layers.insert(0, Layer::default());
     }
     Ok(d)
+}
+
+/// Non-graphical objects applied once every entity is placed.
+#[derive(Default)]
+struct Objects {
+    /// Dictionary entry handle (upper case) → entry name.
+    names: HashMap<String, String>,
+    /// XRECORD handle (upper case) → its groups.
+    xrecords: HashMap<String, Vec<Tag>>,
+    /// TABLESTYLE objects: (handle, groups).
+    table_styles: Vec<(String, Vec<Tag>)>,
+    /// DIMASSOC objects.
+    dimassocs: Vec<Vec<Tag>>,
+}
+
+const MAX_OBJECTS: usize = 1_000_000;
+
+impl Objects {
+    fn add(&mut self, kind: &str, tags: &[Tag]) {
+        let h = T(tags).s(5).map(|h| h.trim().to_ascii_uppercase()).unwrap_or_default();
+        match kind {
+            "DICTIONARY" => {
+                let mut name: Option<String> = None;
+                for t in tags {
+                    match t.code {
+                        3 => name = Some(t.str()),
+                        350 | 360 => {
+                            if let Some(n) = name.take()
+                                && self.names.len() < MAX_OBJECTS
+                            {
+                                self.names.insert(t.str().trim().to_ascii_uppercase(), n);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "XRECORD" if self.xrecords.len() < MAX_OBJECTS => {
+                self.xrecords.insert(h, tags.to_vec());
+            }
+            "TABLESTYLE" if self.table_styles.len() < MAX_OBJECTS => self.table_styles.push((h, tags.to_vec())),
+            "DIMASSOC" if self.dimassocs.len() < MAX_OBJECTS => self.dimassocs.push(tags.to_vec()),
+            _ => {}
+        }
+    }
+
+    fn apply(self, d: &mut Drawing, rx: &Rx) {
+        // Table styles (named by their ACAD_TABLESTYLE dictionary entries).
+        for (h, tags) in &self.table_styles {
+            let Some(name) = self.names.get(h).filter(|n| !n.is_empty()) else { continue };
+            let t = T(tags);
+            let def = TableStyle::default();
+            let pos = |v: f64, d: f64| if v.is_finite() && v > 0.0 { v } else { d };
+            let st = TableStyle {
+                name: name.clone(),
+                text_height: pos(t.fd(140, def.text_height), def.text_height),
+                margin: t.f(40).filter(|m| m.is_finite() && *m >= 0.0).unwrap_or(def.margin),
+                title: t.i(280).unwrap_or(0) == 0,
+                header: t.i(281).unwrap_or(0) == 0,
+            };
+            match d.table_styles.iter_mut().find(|s| s.name.eq_ignore_ascii_case(name)) {
+                Some(x) => *x = st,
+                None => d.table_styles.push(st),
+            }
+        }
+        for (h, sh) in &rx.table_style_fix {
+            if let Some(name) = self.names.get(sh) {
+                let _ = d.modify_entity(*h, |e| {
+                    if let EntityKind::Table(t) = &mut e.kind {
+                        t.style = name.clone();
+                    }
+                });
+            }
+        }
+        // Parametric constraints and parameters.
+        let key = self.names.iter().find(|(_, n)| n.as_str() == crate::dxf_ext::CONSTRAINTS_KEY).map(|(h, _)| h.clone());
+        if let Some(tags) = key.and_then(|k| self.xrecords.get(&k)) {
+            let mut text = String::new();
+            for t in tags.iter().filter(|t| t.code == 1 || t.code == 3) {
+                if text.len() > crate::dxf_ext::MAX_PAYLOAD {
+                    break;
+                }
+                text.push_str(&t.str());
+            }
+            if let Some((c, p)) = crate::dxf_ext::parse_constraints(&text) {
+                d.constraints = c;
+                d.parametric = p;
+            }
+        }
+        // Standard associativity, for dimensions without CADCraft's exact links.
+        for tags in &self.dimassocs {
+            dimassoc(d, tags);
+        }
+    }
+}
+
+/// Associativity from a DIMASSOC object (files from other writers).
+fn dimassoc(d: &mut Drawing, tags: &[Tag]) {
+    let start = tags.iter().position(|x| x.code == 100 && x.str() == "AcDbDimAssoc").unwrap_or(0);
+    let tail = tags.get(start..).unwrap_or(&[]);
+    let Some(dim_h) = tail.iter().find(|x| x.code == 330).and_then(|x| Handle::parse_hex(&x.str())) else { return };
+    let Some(EntityKind::Dimension(dm)) = d.entity(dim_h).map(|e| &e.kind) else { return };
+    if !dm.assoc.is_empty() {
+        return;
+    }
+    let slots: &[&str] = match dm.kind {
+        DimKind::Linear { .. } | DimKind::Aligned => &["p13", "p14"],
+        DimKind::Ordinate { .. } => &["p13"],
+        _ => return,
+    };
+    let flags = T(tail).i(90).unwrap_or(0);
+    let used: Vec<&str> = slots.iter().enumerate().filter(|(i, _)| flags & (1 << i) != 0).map(|(_, s)| *s).collect();
+    // Point references start at each `1 AcDbOsnapPointRef`.
+    let starts: Vec<usize> = tail.iter().enumerate().filter(|(_, x)| x.code == 1).map(|(i, _)| i).take(8).collect();
+    let mut links = Vec::new();
+    for (k, s) in starts.iter().enumerate() {
+        let Some(point) = used.get(k) else { break };
+        let end = starts.get(k + 1).copied().unwrap_or(tail.len());
+        let r = T(tail.get(s + 1..end).unwrap_or(&[]));
+        let Some(main) = r.s(331).and_then(|h| Handle::parse_hex(&h)) else { continue };
+        let other = r.s(332).and_then(|h| Handle::parse_hex(&h));
+        let at = r.p(10).xy();
+        if let Some(snap) = infer_snap(d, r.i(72).unwrap_or(0), main, other, at) {
+            links.push(DimAssoc { point: (*point).to_string(), handle: main, snap });
+        }
+    }
+    if !links.is_empty() {
+        let _ = d.modify_entity(dim_h, |e| {
+            if let EntityKind::Dimension(dm) = &mut e.kind {
+                dm.assoc = links;
+            }
+        });
+    }
+}
+
+/// A CADCraft snap from a DIMASSOC object snap type and point.
+fn infer_snap(d: &Drawing, osnap: i64, main: Handle, other: Option<Handle>, at: Vec2) -> Option<AssocSnap> {
+    let e = d.entity(main)?;
+    Some(match osnap {
+        1 | 13 => match &e.kind {
+            EntityKind::Line(l) => {
+                if osnap == 13 || l.a.xy().dist(at) <= l.b.xy().dist(at) {
+                    AssocSnap::Start
+                } else {
+                    AssocSnap::End
+                }
+            }
+            EntityKind::Arc(a) => {
+                let g = cadcraft_geom::Arc::new(a.center.xy(), a.radius, a.start, a.end);
+                if osnap == 13 || g.start_point().dist(at) <= g.end_point().dist(at) { AssocSnap::Start } else { AssocSnap::End }
+            }
+            EntityKind::LwPolyline(p) => {
+                let index = p.vertices.iter().enumerate().min_by(|x, y| x.1.p.dist(at).total_cmp(&y.1.p.dist(at))).map(|(i, _)| i)?;
+                AssocSnap::Vertex { index }
+            }
+            EntityKind::Point(_) => AssocSnap::Start,
+            _ => return None,
+        },
+        2 => AssocSnap::Mid,
+        3 | 4 => AssocSnap::Center,
+        5 | 10 => match &e.kind {
+            EntityKind::Circle(Circle { center, .. }) | EntityKind::Arc(Arc { center, .. }) => {
+                let v = at - center.xy();
+                AssocSnap::OnCircle { angle: v.y.atan2(v.x) }
+            }
+            _ => return None,
+        },
+        6 => AssocSnap::Intersection { other: other.filter(|o| d.entity(*o).is_some())? },
+        _ => return None,
+    })
 }
 
 /// Page setup from a LAYOUT object's AcDbPlotSettings fields (sizes and margins in mm).
