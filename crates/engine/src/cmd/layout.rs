@@ -67,7 +67,68 @@ pub fn specs() -> Vec<CommandSpec> {
             .menu(&["File", "Export to PDF..."])
             .params("{path? (else returns base64 `data`), layout?, paper?, landscape?, fit?, lineweights?}")
             .noundo(),
+        CommandSpec::new("mspace", "Model Space (in viewport)", run_mspace)
+            .alias(&["ms"])
+            .params("{handle?: viewport, at?: [x,y] paper point inside a viewport} (default: the last active or first viewport)")
+            .noundo(),
+        CommandSpec::new("pspace", "Paper Space", run_pspace).alias(&["ps"]).noundo(),
     ]
+}
+
+// ---------- model space through viewports ----------
+
+fn layout_viewports(s: &Session) -> Result<Vec<(Handle, Viewport)>> {
+    let sp = s.layout_space();
+    if sp == Space::Model {
+        return Err(bad("mspace", "** Command not allowed in Model Tab **"));
+    }
+    let d = s.doc()?;
+    Ok(d.space(&sp)
+        .map(|st| {
+            st.iter()
+                .filter_map(|e| match &e.kind {
+                    EntityKind::Viewport(v) if v.id != 1 && v.height > 1e-12 && v.view_height > 1e-12 => Some((e.handle, v.clone())),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+fn run_mspace(s: &mut Session, p: &Value) -> Result<Value> {
+    let vps = layout_viewports(s)?;
+    let at = p.get("at").and_then(|v| Some(Vec2::new(v.get(0)?.as_f64()?, v.get(1)?.as_f64()?)));
+    let want = p.get("handle").and_then(|v| v.as_str().and_then(Handle::parse_hex).or_else(|| v.as_u64().map(Handle)));
+    let pick = if let Some(h) = want {
+        vps.iter().find(|(x, _)| *x == h).map(|(h, _)| *h).ok_or_else(|| bad("mspace", "`handle` is not a viewport in this layout"))?
+    } else if let Some(a) = at {
+        vps.iter()
+            .rev()
+            .find(|(_, v)| (a.x - v.center.x).abs() <= v.width / 2.0 && (a.y - v.center.y).abs() <= v.height / 2.0)
+            .map(|(h, _)| *h)
+            .ok_or_else(|| bad("mspace", "no viewport at that point"))?
+    } else {
+        let last = s.state()?.mspace;
+        match last.filter(|h| vps.iter().any(|(x, _)| x == h)).or_else(|| vps.first().map(|(h, _)| *h)) {
+            Some(h) => h,
+            None => return Err(bad("mspace", "There are no active model space viewports.")),
+        }
+    };
+    let st = s.state_mut()?;
+    st.mspace = Some(pick);
+    st.selection.clear();
+    s.echo("MSPACE");
+    Ok(json!({ "viewport": pick.hex() }))
+}
+
+fn run_pspace(s: &mut Session, _p: &Value) -> Result<Value> {
+    if s.layout_space() == Space::Model {
+        return Err(bad("pspace", "** Command not allowed in Model Tab **"));
+    }
+    let st = s.state_mut()?;
+    st.mspace = None;
+    st.selection.clear();
+    Ok(json!({ "space": "paper" }))
 }
 
 // ---------- layouts ----------
@@ -149,6 +210,7 @@ fn run_delete(s: &mut Session, p: &Value) -> Result<Value> {
     st.views.retain(|(sp, _)| sp != &gone);
     if st.space == gone {
         st.space = Space::Model;
+        st.mspace = None;
         st.selection.clear();
     }
     s.touch();
@@ -156,7 +218,7 @@ fn run_delete(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn run_rename(s: &mut Session, p: &Value) -> Result<Value> {
-    let from = match (str_param(p, "from"), s.space()) {
+    let from = match (str_param(p, "from"), s.layout_space()) {
         (Some(f), _) => f.to_string(),
         (None, Space::Paper(n)) => n,
         (None, Space::Model) => return Err(bad("layout.rename", "`from` is required in the Model tab")),
@@ -207,7 +269,7 @@ fn run_list(s: &mut Session, _p: &Value) -> Result<Value> {
     let d = s.doc()?;
     let mut ls: Vec<&Layout> = d.layouts.iter().collect();
     ls.sort_by_key(|l| l.tab_order);
-    let current = s.space();
+    let current = s.layout_space();
     Ok(Value::Array(
         ls.iter()
             .map(|l| {
@@ -268,7 +330,7 @@ fn target_layout(s: &Session, cmd: &str, p: &Value) -> Result<Space> {
     if let Some(n) = str_param(p, "layout") {
         return Ok(Space::Paper(layout_name(cmd, s.doc()?, n)?));
     }
-    match s.space() {
+    match s.layout_space() {
         Space::Model => Err(bad(cmd, "** Command not allowed in Model Tab ** (switch to a layout or pass `layout`)")),
         sp => Ok(sp),
     }
@@ -883,5 +945,37 @@ mod tests {
         ] {
             assert!(s.execute(c, &p).is_err(), "{c} {p}");
         }
+    }
+
+    #[test]
+    fn mspace_edits_model_through_viewport() {
+        let mut s = session_with_model();
+        let before = s.doc().unwrap().model.len();
+        s.execute("layout.new", &json!({"name": "L"})).unwrap();
+        s.execute("layout.set", &json!({"name": "L"})).unwrap();
+        assert!(s.execute("mspace", &json!({"at": [-1000, -1000]})).is_err());
+        let vps = viewports(&s, "L");
+        let (h, vp) = vps.iter().find(|(_, v)| v.id != 1).cloned().unwrap();
+        s.execute("mspace", &json!({"at": [vp.center.x, vp.center.y]})).unwrap();
+        assert_eq!(s.space(), Space::Model);
+        assert_eq!(s.layout_space(), Space::Paper("L".into()));
+        // The screen view in MSPACE maps the viewport centre to its model view centre.
+        let st = s.state().unwrap();
+        let (pv, v) = (st.paper_view(), st.view());
+        let k = vp.view_height / vp.height;
+        assert!((v.height - pv.height * k).abs() < 1e-9);
+        // New geometry goes to model space.
+        s.cmdline("circle 10,10 3").unwrap();
+        assert_eq!(s.doc().unwrap().model.len(), before + 1);
+        // Zooming changes the viewport's model view, not the sheet.
+        s.state_mut().unwrap().set_view(crate::View { center: v.center, height: v.height / 2.0 });
+        let vp2 = viewports(&s, "L").into_iter().find(|(x, _)| *x == h).unwrap().1;
+        assert!((vp2.view_height - vp.view_height / 2.0).abs() < 1e-9);
+        assert_eq!(s.state().unwrap().paper_view(), pv);
+        s.execute("pspace", &json!({})).unwrap();
+        assert_eq!(s.space(), Space::Paper("L".into()));
+        s.execute("mspace", &json!({})).unwrap();
+        s.execute("layout.set", &json!({"name": "Model"})).unwrap();
+        assert!(s.state().unwrap().mspace.is_none());
     }
 }

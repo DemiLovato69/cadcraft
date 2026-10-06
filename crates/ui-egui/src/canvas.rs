@@ -78,7 +78,7 @@ pub fn apply_hot_grip(app: &mut CadApp, to: Vec2) {
 #[derive(Default)]
 pub struct CanvasState {
     pub list: Option<DisplayList>,
-    key: (u64, u64, i32, bool),
+    key: (u64, u64, i32, bool, usize),
     /// Set when the app runs on wgpu: entities are drawn by [`crate::gpu`]; otherwise on the CPU.
     pub gpu: Option<crate::gpu::GpuTarget>,
     /// The mesh last handed to the GPU (see [`crate::gpu::CanvasCallback::key`]).
@@ -114,7 +114,7 @@ fn ensure_list(app: &mut CadApp, px: f64) {
     let Ok(st) = app.session.state() else { return };
     // Rebuild when the drawing changes or the zoom moves by more than 2x (tessellation band).
     let band = px.max(1e-300).log2().floor() as i32;
-    let key = (st.uid, st.revision, band, app.session.settings.lwdisplay);
+    let key = (st.uid, st.revision, band, app.session.settings.lwdisplay, std::sync::Arc::as_ptr(&st.doc) as usize);
     if app.canvas.list.is_some() && app.canvas.key == key {
         return;
     }
@@ -424,7 +424,7 @@ fn effective_point(app: &mut CadApp, raw: Vec2, xf: &Xf) -> Vec2 {
     }
     let ap = s.aperture / xf.scale;
     if let Ok(st) = app.session.state()
-        && let Some(hit) = snap::osnap(&st.doc, &st.space, raw, ap, s.osmode, base)
+        && let Some(hit) = snap::osnap(&st.doc, &st.edit_space(), raw, ap, s.osmode, base)
     {
         app.canvas.snap = Some(hit);
         return hit.point;
@@ -464,7 +464,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     app.canvas.xf = Some(xf);
 
     // ---------- input ----------
-    let (hover_pos, scroll, mods, middle_down, pressed_primary, pressed_secondary, dbl_middle) = ui.input(|i| {
+    let (hover_pos, scroll, mods, middle_down, pressed_primary, pressed_secondary, dbl_middle, dbl_primary) = ui.input(|i| {
         (
             i.pointer.hover_pos(),
             i.smooth_scroll_delta.y,
@@ -473,6 +473,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
             i.pointer.primary_clicked(),
             i.pointer.secondary_clicked(),
             i.pointer.button_double_clicked(egui::PointerButton::Middle),
+            i.pointer.button_double_clicked(egui::PointerButton::Primary),
         )
     });
     let inside = hover_pos.is_some_and(|p| rect.contains(p)) && resp.hovered();
@@ -516,6 +517,33 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     let scale = f64::from(rect.height()) / view.height.max(1e-12);
     let xf = Xf { rect, center: view.center, scale };
     app.canvas.xf = Some(xf);
+    // The paper (display) transform; equal to `xf` except inside an MSPACE viewport.
+    let (xf_paper, active_vp) = match app.session.state() {
+        Ok(st) => {
+            let pv = st.paper_view();
+            let xp = Xf { rect, center: pv.center, scale: f64::from(rect.height()) / pv.height.max(1e-12) };
+            (if st.mspace.is_some() { xp } else { xf }, st.active_viewport().map(|(_, v)| v))
+        }
+        Err(_) => (xf, None),
+    };
+    // Double-click a viewport to work inside it; double-click the sheet outside it to return.
+    if inside
+        && dbl_primary
+        && app.session.running.is_none()
+        && matches!(app.session.layout_space(), cadcraft_doc::Space::Paper(_))
+        && let Some(hp) = hover_pos
+    {
+        let pp = xf_paper.to_world(hp);
+        let in_active = active_vp.as_ref().is_some_and(|v| (pp.x - v.center.x).abs() <= v.width / 2.0 && (pp.y - v.center.y).abs() <= v.height / 2.0);
+        if !in_active {
+            app.canvas.hot_grip = None;
+            if app.run("mspace", serde_json::json!({"at": [pp.x, pp.y]})).is_err() && active_vp.is_some() {
+                let _ = app.run("pspace", serde_json::json!({}));
+            }
+            app.canvas.list = None;
+            return;
+        }
+    }
 
     let raw_world = hover_pos.filter(|_| inside).map(|p| xf.to_world(p));
     if let Some(w) = raw_world {
@@ -565,7 +593,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
         if hover_pos != app.canvas.hover_at
             && let (Some(w), Ok(st)) = (raw_world, app.session.state())
         {
-            app.canvas.hover = cadcraft_engine::select::pick(&st.doc, &st.space, w, app.session.settings.pickbox.max(1.0) * 1.5 / scale);
+            app.canvas.hover = cadcraft_engine::select::pick(&st.doc, &st.edit_space(), w, app.session.settings.pickbox.max(1.0) * 1.5 / scale);
             app.canvas.hover_at = hover_pos;
         }
     } else {
@@ -576,20 +604,20 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     // ---------- paint ----------
     painter.rect_filled(rect, 0.0, t.canvas);
     let t0 = crate::now_ms();
-    ensure_list(app, 1.0 / scale);
+    ensure_list(app, 1.0 / xf_paper.scale);
     let sheet = app.canvas.list.as_ref().and_then(|l| l.sheet);
     let bg = match sheet {
         Some(sh) => {
             // Paper space: grey surround, the sheet with a shadow, the printable area dashed.
             painter.rect_filled(rect, 0.0, Color32::from_rgb(0x50, 0x57, 0x63));
-            let a = xf.to_screen(Vec2::new(0.0, sh.size.y));
-            let b = xf.to_screen(Vec2::new(sh.size.x, 0.0));
+            let a = xf_paper.to_screen(Vec2::new(0.0, sh.size.y));
+            let b = xf_paper.to_screen(Vec2::new(sh.size.x, 0.0));
             let paper = Rect::from_two_pos(a, b);
             painter.rect_filled(paper.translate(vec2(5.0, 5.0)), 0.0, Color32::from_black_alpha(110));
             painter.rect_filled(paper, 0.0, Color32::WHITE);
             let pa = Rect::from_two_pos(
-                xf.to_screen(Vec2::new(sh.printable.min.x, sh.printable.max.y)),
-                xf.to_screen(Vec2::new(sh.printable.max.x, sh.printable.min.y)),
+                xf_paper.to_screen(Vec2::new(sh.printable.min.x, sh.printable.max.y)),
+                xf_paper.to_screen(Vec2::new(sh.printable.max.x, sh.printable.min.y)),
             );
             let pts = [pa.left_top(), pa.right_top(), pa.right_bottom(), pa.left_bottom(), pa.left_top()];
             painter.extend(Shape::dashed_line(&pts, Stroke::new(1.0, Color32::from_gray(150)), 4.0, 4.0));
@@ -602,11 +630,33 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     };
     let sel = app.session.selection();
     if app.canvas.gpu.is_some() {
-        draw_list_gpu(&mut app.canvas, &painter, &xf, bg, app.session.settings.lwdisplay);
+        draw_list_gpu(&mut app.canvas, &painter, &xf_paper, bg, app.session.settings.lwdisplay);
     } else if let Some(list) = &app.canvas.list {
-        draw_list(&painter, &xf, list, bg, app.session.settings.lwdisplay);
+        draw_list(&painter, &xf_paper, list, bg, app.session.settings.lwdisplay);
     }
-    if let Some(list) = &app.canvas.list {
+    if let Some(vp) = &active_vp {
+        // The active viewport: a heavy border, highlights in model units clipped to it.
+        let r = Rect::from_two_pos(
+            xf_paper.to_screen(Vec2::new(vp.center.x - vp.width / 2.0, vp.center.y + vp.height / 2.0)),
+            xf_paper.to_screen(Vec2::new(vp.center.x + vp.width / 2.0, vp.center.y - vp.height / 2.0)),
+        );
+        painter.rect_stroke(r, 0.0, Stroke::new(3.0, Color32::from_rgb(0x2a, 0x2a, 0x2a)), egui::StrokeKind::Middle);
+        if let Ok(st) = app.session.state() {
+            let mut hs = sel.clone();
+            hs.extend(app.canvas.hover.filter(|h| !sel.contains(h)));
+            let ents: Vec<_> = hs.iter().filter_map(|h| st.doc.model.get(*h)).map(|e| e.as_ref()).collect();
+            if !ents.is_empty() {
+                let list = cadcraft_render::build_entities(&st.doc, ents, &cadcraft_render::Options { tolerance: 0.5 / scale, ..Default::default() });
+                let clipped = painter.with_clip_rect(r.intersect(rect));
+                if let Some(h) = app.canvas.hover
+                    && !sel.contains(&h)
+                {
+                    draw_highlight(&clipped, &xf, &list, &[h], t.hover, 2.0, false);
+                }
+                draw_highlight(&clipped, &xf, &list, &sel, t.selection, 1.5, true);
+            }
+        }
+    } else if let Some(list) = &app.canvas.list {
         if let Some(h) = app.canvas.hover
             && !sel.contains(&h)
         {

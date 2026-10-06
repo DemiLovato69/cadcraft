@@ -89,6 +89,8 @@ pub struct DocState {
     pub saved: Arc<Drawing>,
     pub revision: u64,
     pub space: Space,
+    /// MSPACE: the layout viewport whose model space is being edited (None = paper space).
+    pub mspace: Option<Handle>,
     pub views: Vec<(Space, View)>,
     pub view_history: Vec<View>,
     pub uid: u64,
@@ -110,6 +112,7 @@ impl DocState {
             title: title.into(),
             revision: 1,
             space: Space::Model,
+            mspace: None,
             views: Vec::new(),
             view_history: Vec::new(),
             uid: NEXT_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -118,8 +121,66 @@ impl DocState {
     pub fn is_dirty(&self) -> bool {
         !Arc::ptr_eq(&self.doc, &self.saved)
     }
-    pub fn view(&self) -> View {
+    /// The space edits, picks and snaps act on: model space inside an active viewport.
+    pub fn edit_space(&self) -> Space {
+        if self.active_viewport().is_some() { Space::Model } else { self.space.clone() }
+    }
+    /// The active MSPACE viewport, if it still exists in the current layout.
+    pub fn active_viewport(&self) -> Option<(Handle, cadcraft_doc::Viewport)> {
+        let h = self.mspace?;
+        let e = self.doc.space(&self.space)?.get(h)?;
+        match &e.kind {
+            cadcraft_doc::EntityKind::Viewport(v) if v.height > 1e-12 && v.view_height > 1e-12 => Some((h, v.clone())),
+            _ => None,
+        }
+    }
+    pub fn paper_view(&self) -> View {
         self.views.iter().find(|(s, _)| *s == self.space).map(|(_, v)| *v).unwrap_or_default()
+    }
+    /// The screen view. Inside an MSPACE viewport this is the model-space view that maps the
+    /// screen consistently with the paper view, so picks, snaps and previews work in model units.
+    pub fn view(&self) -> View {
+        let pv = self.paper_view();
+        match self.active_viewport() {
+            Some((_, vp)) => {
+                let k = vp.view_height / vp.height;
+                View { center: vp.view_center + (pv.center - vp.center.xy()) * k, height: pv.height * k }
+            }
+            None => pv,
+        }
+    }
+    /// Map a requested screen view to the paper view, or (in MSPACE) to the viewport's model view.
+    fn store_view(&mut self, v: View) {
+        if let Some((h, vp)) = self.active_viewport() {
+            let pv = self.paper_view();
+            let k = v.height / pv.height.max(1e-12);
+            if vp.locked {
+                // A locked viewport keeps its scale: pan/zoom the sheet instead.
+                let k0 = vp.view_height / vp.height;
+                let pc = vp.center.xy() + (v.center - vp.view_center) / k0;
+                self.put_paper_view(View { center: pc, height: v.height / k0 });
+            } else {
+                let center = v.center - (pv.center - vp.center.xy()) * k;
+                let height = vp.height * k;
+                let doc = Arc::make_mut(&mut self.doc);
+                if let Some(store) = doc.space_mut(&self.space.clone()) {
+                    store.modify(h, |e| {
+                        if let cadcraft_doc::EntityKind::Viewport(x) = &mut e.kind {
+                            x.view_center = center;
+                            x.view_height = height;
+                        }
+                    });
+                }
+            }
+            return;
+        }
+        self.put_paper_view(v);
+    }
+    fn put_paper_view(&mut self, v: View) {
+        match self.views.iter_mut().find(|(s, _)| *s == self.space) {
+            Some((_, slot)) => *slot = v,
+            None => self.views.push((self.space.clone(), v)),
+        }
     }
     pub fn set_view(&mut self, v: View) {
         if !(v.center.is_finite() && v.height.is_finite() && v.height > 1e-12) {
@@ -132,20 +193,14 @@ impl DocState {
                 self.view_history.remove(0);
             }
         }
-        match self.views.iter_mut().find(|(s, _)| *s == self.space) {
-            Some((_, slot)) => *slot = v,
-            None => self.views.push((self.space.clone(), v)),
-        }
+        self.store_view(v);
     }
     /// Set without recording view history (realtime pan/zoom frames).
     pub fn set_view_quiet(&mut self, v: View) {
         if !(v.center.is_finite() && v.height.is_finite() && v.height > 1e-12) {
             return;
         }
-        match self.views.iter_mut().find(|(s, _)| *s == self.space) {
-            Some((_, slot)) => *slot = v,
-            None => self.views.push((self.space.clone(), v)),
-        }
+        self.store_view(v);
     }
 }
 
@@ -316,7 +371,12 @@ impl Session {
     pub fn doc_mut(&mut self) -> Result<&mut Drawing> {
         Ok(Arc::make_mut(&mut self.state_mut()?.doc))
     }
+    /// The space commands act on (model space while working inside a layout viewport).
     pub fn space(&self) -> Space {
+        self.state().map(|s| s.edit_space()).unwrap_or_default()
+    }
+    /// The tab being displayed: Model or a layout, regardless of MSPACE.
+    pub fn layout_space(&self) -> Space {
         self.state().map(|s| s.space.clone()).unwrap_or_default()
     }
     pub fn selection(&self) -> Vec<Handle> {

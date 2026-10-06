@@ -206,6 +206,7 @@ fn run_layout_set(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let st = s.state_mut()?;
     st.space = space.clone();
+    st.mspace = None;
     st.selection.clear();
     if let Space::Paper(n) = &space
         && !st.views.iter().any(|(sp, _)| sp == &space)
