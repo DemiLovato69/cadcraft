@@ -183,7 +183,7 @@ pub fn status_bar(app: &mut CadApp, ui: &mut egui::Ui) {
             let resp = ui.interact(br, ui.id().with(("sb", tip)), Sense::click());
             icons::paint(&p, br.shrink(2.0), icon, false);
             if resp.on_hover_text(tip).clicked() && icon == Icon::Plus {
-                app.set_status("New layout: coming soon");
+                let _ = app.run("layout.new", json!({}));
             }
             x += 22.0;
         }
@@ -218,7 +218,14 @@ pub fn status_bar(app: &mut CadApp, ui: &mut egui::Ui) {
             x += w + 2.0;
             if i == 0 {
                 let pr = Rect::from_min_size(pos2(x, r.top() + 5.0), vec2(16.0, 16.0));
+                let presp = ui.interact(pr, ui.id().with("layout_plus"), Sense::click());
                 icons::paint(&p, pr.shrink(2.0), Icon::Plus, false);
+                if presp.on_hover_text("New layout").clicked()
+                    && let Ok(v) = app.run("layout.new", json!({}))
+                    && let Some(n) = v.get("name").and_then(serde_json::Value::as_str)
+                {
+                    switch = Some(n.to_string());
+                }
                 x += 22.0;
             }
         }
