@@ -115,3 +115,71 @@ fn raster_rejects_bad_size() {
     let l = DisplayList::default();
     assert!(render(&l, &View { center: Vec2::ZERO, scale: 1.0, width: 0, height: 10 }, &RasterOptions::default()).is_none());
 }
+
+fn layout_with_viewport(vp: cadcraft_doc::Viewport) -> Drawing {
+    let mut d = sample(); // line (0,0)-(10,0) and red circle at (5,5) r3
+    let paper = Space::Paper("Layout1".into());
+    d.add(&paper, Common::default(), EntityKind::Viewport(vp)).unwrap();
+    d
+}
+
+fn vp(center: Vec2, w: f64, h: f64, view_center: Vec2, view_height: f64, id: u32) -> cadcraft_doc::Viewport {
+    cadcraft_doc::Viewport { center: center.to3(0.0), width: w, height: h, view_center, view_height, id, locked: false, frozen_layers: Vec::new() }
+}
+
+#[test]
+fn layout_viewport_shows_model_clipped() {
+    // Viewport 4x4 paper units centred at (5,4), showing model window centred at (5,5), 8 high:
+    // scale 0.5, so model (5,5) → paper (5,4); the visible model window is (1,1)..(9,9).
+    let d = layout_with_viewport(vp(Vec2::new(5.0, 4.0), 4.0, 4.0, Vec2::new(5.0, 5.0), 8.0, 2));
+    let l = build(&d, &Space::Paper("Layout1".into()), &Options { tolerance: 0.01, ..Default::default() });
+    let sheet = l.sheet.unwrap();
+    assert!(sheet.size.x > sheet.size.y, "landscape sheet");
+    let rect = Bounds2::new(Vec2::new(3.0, 2.0), Vec2::new(7.0, 6.0)).expand(1e-9);
+    let content: Vec<&DPrim> = l.prims.iter().filter(|p| p.handle == VIEWPORT_CONTENT).collect();
+    assert!(!content.is_empty(), "model geometry is drawn in the viewport");
+    for p in &content {
+        for q in l.points(p) {
+            assert!(rect.contains(*q), "{q:?} outside the viewport");
+        }
+    }
+    // The circle (red) is visible, scaled by 0.5 about the view centre: radius 1.5 around (5,4).
+    let red: Vec<Vec2> = content.iter().filter(|p| p.color == Rgb(255, 0, 0)).flat_map(|p| l.points(p).to_vec()).collect();
+    assert!(!red.is_empty());
+    assert!(red.iter().all(|q| (q.dist(Vec2::new(5.0, 4.0)) - 1.5).abs() < 0.02));
+    // The line y=0 maps to paper y=1.5, below the viewport: clipped away entirely.
+    assert!(content.iter().filter(|p| p.color != Rgb(255, 0, 0)).all(|p| l.points(p).iter().all(|q| q.y > 1.9)));
+    // The border is drawn with the viewport's own handle.
+    assert!(l.prims.iter().any(|p| p.handle != VIEWPORT_CONTENT));
+}
+
+#[test]
+fn layout_viewport_frozen_layer_and_id1() {
+    let mut v = vp(Vec2::new(5.0, 4.0), 20.0, 20.0, Vec2::new(5.0, 5.0), 20.0, 2);
+    v.frozen_layers = vec!["0".into()];
+    let d = layout_with_viewport(v);
+    let l = build(&d, &Space::Paper("Layout1".into()), &Options::default());
+    assert!(l.prims.iter().all(|p| p.handle != VIEWPORT_CONTENT), "layer 0 is frozen in this viewport");
+    // Viewport id 1 (the paper-space view) draws nothing.
+    let d = layout_with_viewport(vp(Vec2::new(5.0, 4.0), 20.0, 20.0, Vec2::new(5.0, 5.0), 20.0, 1));
+    assert!(build(&d, &Space::Paper("Layout1".into()), &Options::default()).prims.is_empty());
+    // Model space never draws viewport contents; plotting skips non-plot layers.
+    let mut d = sample();
+    d.layer_mut("0").unwrap().plot = false;
+    assert!(build_plot(&d, &Space::Model, &Options::default()).prims.is_empty());
+    assert!(!build(&d, &Space::Model, &Options::default()).prims.is_empty());
+}
+
+#[test]
+fn hostile_viewports_do_not_panic() {
+    for v in [
+        vp(Vec2::new(f64::NAN, 0.0), 1.0, 1.0, Vec2::ZERO, 1.0, 2),
+        vp(Vec2::ZERO, -1.0, 1.0, Vec2::ZERO, 1.0, 2),
+        vp(Vec2::ZERO, 1.0, 1.0, Vec2::ZERO, 0.0, 2),
+        vp(Vec2::ZERO, 1e308, 1e308, Vec2::new(1e308, -1e308), 1e-308, 2),
+        vp(Vec2::ZERO, 1.0, 1.0, Vec2::new(f64::INFINITY, 0.0), 1.0, 2),
+    ] {
+        let d = layout_with_viewport(v);
+        let _ = build(&d, &Space::Paper("Layout1".into()), &Options::default());
+    }
+}

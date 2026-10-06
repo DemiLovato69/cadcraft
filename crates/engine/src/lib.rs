@@ -9,10 +9,12 @@
 #![forbid(unsafe_code)]
 
 pub mod cmd;
+pub mod grips;
 pub mod prompt;
 pub mod sample;
 pub mod select;
 pub mod snap;
+pub mod spatial;
 pub mod sysvars;
 pub mod units;
 

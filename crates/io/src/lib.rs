@@ -1,12 +1,15 @@
-//! CADCraft file formats: DXF read/write, SVG and PNG export.
+//! CADCraft file formats: DXF read/write, SVG, PNG and PDF export (plotting).
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
 mod dxf_read;
 mod dxf_write;
+pub mod pdf;
 pub mod svg;
 
 use cadcraft_doc::{Drawing, Space};
+
+pub use pdf::{PdfOptions, pdf, plot};
 
 #[derive(Debug, thiserror::Error)]
 pub enum IoError {
@@ -42,6 +45,7 @@ pub fn write(d: &Drawing, name: &str) -> Result<Vec<u8>> {
         "dwg" => cadcraft_dwg::dxf_to_dwg(dxf_write::write(d).as_bytes()).map_err(IoError::Format),
         "svg" => Ok(svg::export(d, &Space::Model).into_bytes()),
         "png" => png(d, &Space::Model, 2400, 1600),
+        "pdf" => pdf::pdf(d, &Space::Model, &PdfOptions { compress: true, ..PdfOptions::default() }),
         e => Err(IoError::Unsupported(e.to_string())),
     }
 }

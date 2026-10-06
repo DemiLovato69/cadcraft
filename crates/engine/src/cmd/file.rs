@@ -9,10 +9,15 @@ use serde_json::{Value, json};
 use super::*;
 use crate::{Result, Session};
 
+/// Plot a space to PDF bytes with JSON options (`{paper?, landscape?, fit?, lineweights?, …}`).
+pub type PlotHook = fn(&Drawing, &cadcraft_doc::Space, &Value) -> std::result::Result<Vec<u8>, String>;
+
 /// File format hooks (installed by the app so the engine stays I/O-agnostic and wasm-safe).
 pub struct IoHooks {
     pub read: fn(&[u8], &str) -> std::result::Result<Drawing, String>,
     pub write: fn(&Drawing, &str) -> std::result::Result<Vec<u8>, String>,
+    /// PLOT / EXPORTPDF (optional: builds without a plotter report "not available").
+    pub plot: Option<PlotHook>,
 }
 
 static IO: OnceLock<IoHooks> = OnceLock::new();

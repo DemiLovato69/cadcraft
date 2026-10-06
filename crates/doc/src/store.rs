@@ -189,6 +189,11 @@ impl EntityStore {
             None => false,
         }
     }
+    /// True when `other` shares every chunk with `self` (same draw order, same entities). Holding
+    /// a clone of a store makes this exact: any edit to the original copies the touched chunk.
+    pub fn same_as(&self, other: &EntityStore) -> bool {
+        self.len == other.len && self.chunks.len() == other.chunks.len() && self.chunks.iter().zip(&other.chunks).all(|(a, b)| Arc::ptr_eq(a, b))
+    }
     /// The last entity in draw order (AutoCAD's "Last" selection).
     pub fn last(&self) -> Option<&Arc<Entity>> {
         self.chunks.last().and_then(|c| c.items.last())

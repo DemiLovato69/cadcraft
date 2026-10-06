@@ -535,6 +535,8 @@ fn entity(w: &mut W, d: &Drawing, e: &Entity, owner: &str, paper: bool, dim_bloc
             w.i(69, i64::from(v.id));
             w.p2(12, v.view_center);
             w.f(45, v.view_height);
+            // Status flags: 16384 = display locked.
+            w.i(90, if v.locked { 16384 } else { 0 });
         }
         // Not yet written: images, wipeouts, tables, multileaders, unknown objects.
         _ => {}
@@ -918,7 +920,7 @@ pub fn write(d: &Drawing) -> String {
         w.s(100, "AcDbPlotSettings");
         w.s(1, "");
         w.s(2, "none_device");
-        w.s(4, "");
+        w.s(4, page.paper.replace(' ', "_"));
         w.s(6, "");
         for (c, v) in [
             (40, page.margins_mm[0]),

@@ -9,6 +9,7 @@
 
 mod mtext;
 mod stroke;
+pub mod ttf;
 
 use cadcraft_geom::{Bounds2, Vec2};
 
@@ -280,5 +281,28 @@ mod tests {
         let (_, bb) = place_text("ABC", Vec2::ZERO, Some(Vec2::new(10.0, 0.0)), 1.0, 0.0, 1.0, 0.0, Align::Fit, VAlign::Baseline);
         assert!((bb.width() - 10.0).abs() < 1e-6);
         assert!((bb.max.y - 1.0).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod ttf_tests {
+    #[test]
+    fn system_font_outlines_when_available() {
+        // Skips cleanly when no common system font is installed.
+        let Some(bytes) = ["Arial", "Helvetica", "DejaVuSans", "Verdana", "LiberationSans-Regular"].iter().find_map(|n| crate::ttf::find(n)) else {
+            return;
+        };
+        let run = crate::ttf::layout_line(&bytes, "CAD", 1.0, 1.0, 0.0).unwrap();
+        assert!(run.strokes.len() >= 3, "glyph contours");
+        assert!(run.width > 1.5 && run.width < 4.0, "width {}", run.width);
+        let maxy = run.strokes.iter().flatten().map(|p| p.y).fold(f64::MIN, f64::max);
+        assert!((maxy - 1.0).abs() < 0.1, "cap height ~ text height, got {maxy}");
+    }
+
+    #[test]
+    fn stroke_names_are_not_ttf() {
+        assert!(crate::ttf::find("txt.shx").is_none());
+        assert!(crate::ttf::find("").is_none());
+        assert!(crate::ttf::layout_line(b"not a font", "x", 1.0, 1.0, 0.0).is_none());
     }
 }

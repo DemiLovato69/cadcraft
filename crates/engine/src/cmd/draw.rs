@@ -31,12 +31,12 @@ pub fn specs() -> Vec<CommandSpec> {
             .menu(&["Draw", "Arc", "3 Points"])
             .alias(&["a"])
             .params("{p1, p2, p3} | {center, radius, start, end (degrees)} | {start, center, end}")
-            .interactive(|_| Ok(Box::new(ArcM::default()))),
-        CommandSpec::new("rectang", "Rectangle", run_rectang)
+            .interactive(|_| Ok(super::draw2::arc_machine())),
+        CommandSpec::new("rectang", "Rectangle", super::draw2::run_rectang2)
             .menu(&["Draw", "Rectangle"])
             .alias(&["rec", "rectangle"])
-            .params("{p1, p2, fillet?, chamfer?: [d1, d2], width?}")
-            .interactive(|_| Ok(Box::new(RectM::default()))),
+            .params("{p1, p2 | dimensions: [l, w] (p2 picks the quadrant) | area + length|breadth, rotation? (deg), fillet?, chamfer?: [d1, d2], width?, elevation?, thickness?}")
+            .interactive(|_| Ok(Box::new(super::draw2::RectM2::default()))),
         CommandSpec::new("polygon", "Polygon", run_polygon)
             .menu(&["Draw", "Polygon"])
             .alias(&["pol"])
@@ -56,11 +56,11 @@ pub fn specs() -> Vec<CommandSpec> {
             .menu(&["Draw", "Point", "Multiple Point"])
             .params("{points: [...]}")
             .interactive(|_| Ok(Box::new(PointM { multiple: true }))),
-        CommandSpec::new("xline", "Construction Line", run_xline)
+        CommandSpec::new("xline", "Construction Line", super::draw2::run_xline2)
             .menu(&["Draw", "Construction Line"])
             .alias(&["xl"])
-            .params("{base, through} | {base, angle (degrees)}")
-            .interactive(|_| Ok(Box::new(XlineM { ray: false, base: None, fixed_angle: None }))),
+            .params("{base, through} | {base, angle (degrees)} | {base, hor|ver: true} | {vertex, start, end} (bisect) | {handle, distance, side} | {handle, through} (offset)")
+            .interactive(|_| Ok(Box::new(super::draw2::XlineM2::default()))),
         CommandSpec::new("ray", "Ray", run_ray)
             .menu(&["Draw", "Ray"])
             .params("{base, through}")
@@ -175,22 +175,6 @@ fn run_arc(s: &mut Session, p: &Value) -> Result<Value> {
     added(s.add_entity(arc(&a))?)
 }
 
-fn run_rectang(s: &mut Session, p: &Value) -> Result<Value> {
-    let a = point_req("rectang", p, "p1")?;
-    let b = point_req("rectang", p, "p2")?;
-    let ch = p
-        .get("chamfer")
-        .and_then(Value::as_array)
-        .map(|c| (c.first().and_then(Value::as_f64).unwrap_or(0.0), c.get(1).and_then(Value::as_f64).unwrap_or(0.0)))
-        .unwrap_or((0.0, 0.0));
-    let vs = rect_with_corners(a, b, f64_or(p, "fillet", 0.0), ch);
-    let mut k = lwpoly(vs, true);
-    if let EntityKind::LwPolyline(pl) = &mut k {
-        pl.const_width = f64_or(p, "width", 0.0).max(0.0);
-    }
-    added(s.add_entity(k)?)
-}
-
 fn run_polygon(s: &mut Session, p: &Value) -> Result<Value> {
     let n = p.get("sides").and_then(Value::as_u64).unwrap_or(4) as usize;
     if !(3..=1024).contains(&n) {
@@ -236,18 +220,6 @@ fn run_point(s: &mut Session, p: &Value) -> Result<Value> {
         hs.push(s.add_entity(EntityKind::Point(Point { p: v3(q), angle: 0.0 }))?.hex());
     }
     Ok(json!({ "handles": hs }))
-}
-
-fn run_xline(s: &mut Session, p: &Value) -> Result<Value> {
-    let b = point_req("xline", p, "base")?;
-    let dir = match point_param(p, "through") {
-        Some(t) => (t - b).normalized(),
-        None => Vec2::from_angle(f64_req("xline", p, "angle")?.to_radians()),
-    };
-    if dir == Vec2::ZERO {
-        return Err(bad("xline", "through point equals base"));
-    }
-    added(s.add_entity(EntityKind::XLine(RayLine { base: v3(b), dir: v3(dir) }))?)
 }
 
 fn run_ray(s: &mut Session, p: &Value) -> Result<Value> {
@@ -581,6 +553,8 @@ struct CircleM {
     mode: u8, // 0 center-radius, 1 = 3P, 2 = 2P, 3 = TTR
     pts: Vec<Vec2>,
     diameter: bool,
+    /// The `Ttr` option hands over to the tangent-circle machine.
+    delegate: Option<Box<dyn Interactive>>,
 }
 
 impl Interactive for CircleM {
@@ -588,6 +562,9 @@ impl Interactive for CircleM {
         "CIRCLE"
     }
     fn prompt(&self, s: &Session) -> Prompt {
+        if let Some(d) = &self.delegate {
+            return d.prompt(s);
+        }
         let n = self.pts.len();
         let last_r = s.doc().map(|d| d.header.f64("CIRCLERAD", 0.0)).unwrap_or(0.0);
         match (self.mode, n) {
@@ -611,6 +588,9 @@ impl Interactive for CircleM {
         }
     }
     fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
+        if let Some(d) = &mut self.delegate {
+            return d.input(s, i);
+        }
         match i {
             Input::Keyword(k) => {
                 self.mode = match k.as_str() {
@@ -621,8 +601,8 @@ impl Interactive for CircleM {
                         self.mode
                     }
                     _ => {
-                        s.echo("Ttr: not available yet");
-                        self.mode
+                        self.delegate = Some(Box::new(super::draw2::TanCircleM::new(true)));
+                        3
                     }
                 };
                 Ok(Step::Continue)
@@ -667,7 +647,10 @@ impl Interactive for CircleM {
             _ => Ok(Step::Continue),
         }
     }
-    fn preview(&self, _s: &Session, c: Vec2) -> Vec<EntityKind> {
+    fn preview(&self, s: &Session, c: Vec2) -> Vec<EntityKind> {
+        if let Some(d) = &self.delegate {
+            return d.preview(s, c);
+        }
         match (self.mode, self.pts.as_slice()) {
             (0, [center]) => {
                 let r = if self.diameter { center.dist(c) / 2.0 } else { center.dist(c) };
@@ -687,161 +670,6 @@ fn finish_circle(s: &mut Session, c: Circle) -> Result<()> {
     s.add_entity(circle(c.center, c.radius))?;
     s.doc_mut()?.header.set_f64("CIRCLERAD", c.radius);
     Ok(())
-}
-
-#[derive(Default)]
-struct ArcM {
-    pts: Vec<Vec2>,
-    center_first: bool,
-    center: Option<Vec2>,
-}
-
-impl Interactive for ArcM {
-    fn name(&self) -> &'static str {
-        "ARC"
-    }
-    fn prompt(&self, _s: &Session) -> Prompt {
-        if self.center_first {
-            return match (self.center, self.pts.len()) {
-                (None, _) => Prompt::new("Specify center point of arc", Accept::POINT),
-                (Some(c), 0) => Prompt::new("Specify start point of arc", Accept::POINT).base(c),
-                (Some(c), _) => {
-                    Prompt::new("Specify end point of arc (hold Ctrl to switch direction)", Accept::POINT).kw(&["Angle", "chord Length"]).base(c)
-                }
-            };
-        }
-        match self.pts.len() {
-            0 => Prompt::new("Specify start point of arc", Accept::POINT).kw(&["Center"]),
-            1 => Prompt::new("Specify second point of arc", Accept::POINT).kw(&["Center", "End"]).base_opt(self.pts.last().copied()),
-            _ => Prompt::new("Specify end point of arc", Accept::POINT).base_opt(self.pts.last().copied()),
-        }
-    }
-    fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
-        match i {
-            Input::Keyword(k) if k == "Center" => {
-                self.center_first = true;
-                if !self.pts.is_empty() {
-                    // Start point already given: S,C,E.
-                    self.center = None;
-                }
-                Ok(Step::Continue)
-            }
-            Input::Point(p) => {
-                if self.center_first {
-                    if self.center.is_none() && self.pts.is_empty() {
-                        self.center = Some(p);
-                        return Ok(Step::Continue);
-                    }
-                    if self.center.is_none() {
-                        self.center = Some(p);
-                        return Ok(Step::Continue);
-                    }
-                    self.pts.push(p);
-                    if let (Some(c), 2) = (self.center, self.pts.len()) {
-                        s.add_entity(arc(&Arc::from_start_center_end(self.pts[0], c, self.pts[1])))?;
-                        return Ok(Step::Done);
-                    }
-                    return Ok(Step::Continue);
-                }
-                self.pts.push(p);
-                if self.pts.len() == 3 {
-                    match Arc::from_3_points(self.pts[0], self.pts[1], self.pts[2]) {
-                        Some(a) => {
-                            s.add_entity(arc(&a))?;
-                            return Ok(Step::Done);
-                        }
-                        None => {
-                            self.pts.pop();
-                            return Err(crate::EngineError::Other("Points are collinear.".into()));
-                        }
-                    }
-                }
-                Ok(Step::Continue)
-            }
-            Input::Enter => Ok(Step::Cancel),
-            _ => Ok(Step::Continue),
-        }
-    }
-    fn preview(&self, _s: &Session, c: Vec2) -> Vec<EntityKind> {
-        if self.center_first {
-            return match (self.center, self.pts.as_slice()) {
-                (Some(ctr), [st]) => vec![arc(&Arc::from_start_center_end(*st, ctr, c))],
-                (Some(ctr), []) => vec![line(ctr, c)],
-                _ => Vec::new(),
-            };
-        }
-        match self.pts.as_slice() {
-            [a, b] => Arc::from_3_points(*a, *b, c).map(|ar| vec![arc(&ar)]).unwrap_or_else(|| vec![line(*a, c)]),
-            [a] => vec![line(*a, c)],
-            _ => Vec::new(),
-        }
-    }
-}
-
-#[derive(Default)]
-struct RectM {
-    first: Option<Vec2>,
-    fillet: f64,
-    chamfer: (f64, f64),
-    asking: Option<&'static str>,
-}
-
-impl Interactive for RectM {
-    fn name(&self) -> &'static str {
-        "RECTANG"
-    }
-    fn prompt(&self, _s: &Session) -> Prompt {
-        if let Some(a) = self.asking {
-            return Prompt::new(a, Accept::NUMBER);
-        }
-        match self.first {
-            None => Prompt::new("Specify first corner point", Accept::POINT).kw(&["Chamfer", "Elevation", "Fillet", "Thickness", "Width"]),
-            Some(p) => Prompt::new("Specify other corner point", Accept::POINT).kw(&["Area", "Dimensions", "Rotation"]).base(p),
-        }
-    }
-    fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
-        if let Some(a) = self.asking {
-            if let Input::Text(t) = &i {
-                let v = number(t).ok_or_else(|| crate::EngineError::Other("Requires a distance.".into()))?;
-                match a {
-                    "Specify fillet radius for rectangles" => self.fillet = v.max(0.0),
-                    "Specify first chamfer distance for rectangles" => {
-                        self.chamfer.0 = v.max(0.0);
-                        self.asking = Some("Specify second chamfer distance for rectangles");
-                        return Ok(Step::Continue);
-                    }
-                    _ => self.chamfer.1 = v.max(0.0),
-                }
-            }
-            self.asking = None;
-            return Ok(Step::Continue);
-        }
-        match i {
-            Input::Keyword(k) => {
-                match k.as_str() {
-                    "Fillet" => self.asking = Some("Specify fillet radius for rectangles"),
-                    "Chamfer" => self.asking = Some("Specify first chamfer distance for rectangles"),
-                    _ => s.echo(format!("{k}: not available yet")),
-                }
-                Ok(Step::Continue)
-            }
-            Input::Point(p) => match self.first {
-                None => {
-                    self.first = Some(p);
-                    Ok(Step::Continue)
-                }
-                Some(a) => {
-                    s.add_entity(lwpoly(rect_with_corners(a, p, self.fillet, self.chamfer), true))?;
-                    Ok(Step::Done)
-                }
-            },
-            Input::Enter => Ok(Step::Cancel),
-            _ => Ok(Step::Continue),
-        }
-    }
-    fn preview(&self, _s: &Session, c: Vec2) -> Vec<EntityKind> {
-        self.first.map(|a| vec![lwpoly(rect_with_corners(a, c, self.fillet, self.chamfer), true)]).unwrap_or_default()
-    }
 }
 
 #[derive(Default)]
@@ -930,6 +758,11 @@ impl Interactive for PolygonM {
             _ => Vec::new(),
         }
     }
+}
+
+/// ELLIPSE prompt machine starting in axis-end or center mode, optionally for an elliptical arc.
+pub(crate) fn ellipse_machine(center: bool, arc: bool) -> Box<dyn Interactive> {
+    Box::new(EllipseM { center_mode: center, arc_mode: arc, ..Default::default() })
 }
 
 #[derive(Default)]
@@ -1036,6 +869,10 @@ impl Interactive for EllipseM {
                 if let Some((c, m)) = self.axis()
                     && let Some(e) = self.build(c + m.normalized().perp() * d)
                 {
+                    if self.arc_mode {
+                        self.ellipse = Some(e);
+                        return Ok(Step::Continue);
+                    }
                     s.add_entity(EntityKind::Ellipse(cadcraft_doc::Ellipse {
                         center: v3(e.center),
                         major: v3(e.major),

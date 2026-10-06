@@ -3,6 +3,8 @@
 use cadcraft_doc::{Drawing, Entity, EntityKind, Handle, Prim, Space, entity_bounds};
 use cadcraft_geom::{Bounds2, Line, Vec2};
 
+use crate::spatial::{self, SpatialIndex};
+
 /// Polylines approximating an entity for hit testing, tessellated at `tol`.
 pub fn hit_polylines(d: &Drawing, e: &Entity, tol: f64) -> Vec<Vec<Vec2>> {
     match &e.kind {
@@ -83,18 +85,57 @@ fn selectable(d: &Drawing, e: &Entity) -> bool {
     d.is_visible(e)
 }
 
+/// Entities to test, in the order to test them, each with its bounds when already known.
+pub(crate) type Cands<'a> = Box<dyn Iterator<Item = (&'a Entity, Option<Bounds2>)> + 'a>;
+
+pub(crate) fn bounds_of(d: &Drawing, e: &Entity, known: Option<Bounds2>) -> Bounds2 {
+    known.unwrap_or_else(|| entity_bounds(d, e, 0))
+}
+
+pub(crate) fn is_infinite(e: &Entity) -> bool {
+    matches!(e.kind, EntityKind::XLine(_) | EntityKind::Ray(_))
+}
+
+/// Candidates from the spatial index touching `query` (draw order, reversed when `rev`), or every
+/// entity of the space when it is too small to index (or the query box isn't finite).
+pub(crate) fn candidates<'a>(
+    d: &'a Drawing,
+    space: &Space,
+    ix: &'a Option<std::sync::Arc<SpatialIndex>>,
+    query: &Bounds2,
+    infinite: bool,
+    rev: bool,
+) -> Option<Cands<'a>> {
+    if let Some(ix) = ix
+        && let Some(c) = ix.query(query, infinite)
+    {
+        let it = move |i: u32| ix.entity(i).map(|e| (e.as_ref(), Some(ix.bounds(i))));
+        return Some(if rev { Box::new(c.into_iter().rev().filter_map(it)) } else { Box::new(c.into_iter().filter_map(it)) });
+    }
+    let store = d.space(space)?;
+    if rev {
+        let ents: Vec<&Entity> = store.iter().map(|e| e.as_ref()).collect();
+        Some(Box::new(ents.into_iter().rev().map(|e| (e, None))))
+    } else {
+        Some(Box::new(store.iter().map(|e| (e.as_ref(), None))))
+    }
+}
+
 /// The topmost entity within `aperture` of `p`.
 pub fn pick(d: &Drawing, space: &Space, p: Vec2, aperture: f64) -> Option<Handle> {
-    let store = d.space(space)?;
+    let ix = spatial::index(d, space);
+    pick_with(d, space, &ix, p, aperture)
+}
+
+pub(crate) fn pick_with(d: &Drawing, space: &Space, ix: &Option<std::sync::Arc<SpatialIndex>>, p: Vec2, aperture: f64) -> Option<Handle> {
     let probe = Bounds2::new(p, p).expand(aperture);
     let mut best: Option<(f64, Handle)> = None;
-    let ents: Vec<_> = store.iter().collect();
-    for e in ents.iter().rev() {
+    for (e, known) in candidates(d, space, ix, &probe.expand(aperture), true, true)? {
         if !selectable(d, e) {
             continue;
         }
-        let infinite = matches!(e.kind, EntityKind::XLine(_) | EntityKind::Ray(_));
-        if !infinite && !entity_bounds(d, e, 0).expand(aperture).intersects(&probe) {
+        let infinite = is_infinite(e);
+        if !infinite && !bounds_of(d, e, known).expand(aperture).intersects(&probe) {
             continue;
         }
         let dist = entity_distance(d, e, p, aperture / 4.0);
@@ -118,15 +159,20 @@ fn seg_hits_box(a: Vec2, b: Vec2, bx: &Bounds2) -> bool {
 
 /// Window selection (entirely inside) or crossing selection (inside or touching).
 pub fn select_window(d: &Drawing, space: &Space, bx: Bounds2, crossing: bool) -> Vec<Handle> {
-    let Some(store) = d.space(space) else { return Vec::new() };
+    let ix = spatial::index(d, space);
+    select_window_with(d, space, &ix, bx, crossing)
+}
+
+pub(crate) fn select_window_with(d: &Drawing, space: &Space, ix: &Option<std::sync::Arc<SpatialIndex>>, bx: Bounds2, crossing: bool) -> Vec<Handle> {
+    let Some(cands) = candidates(d, space, ix, &bx, crossing, false) else { return Vec::new() };
     let tol = (bx.width() + bx.height()).max(1e-9) / 2000.0;
     let mut out = Vec::new();
-    for e in store.iter() {
+    for (e, known) in cands {
         if !selectable(d, e) {
             continue;
         }
-        let infinite = matches!(e.kind, EntityKind::XLine(_) | EntityKind::Ray(_));
-        let eb = entity_bounds(d, e, 0);
+        let infinite = is_infinite(e);
+        let eb = bounds_of(d, e, known);
         if !infinite && bx.contains_box(&eb) {
             out.push(e.handle);
             continue;
@@ -152,12 +198,18 @@ pub fn select_window(d: &Drawing, space: &Space, bx: Bounds2, crossing: bool) ->
 
 /// Fence selection: entities crossed by the fence polyline.
 pub fn select_fence(d: &Drawing, space: &Space, fence: &[Vec2]) -> Vec<Handle> {
-    let Some(store) = d.space(space) else { return Vec::new() };
+    let ix = spatial::index(d, space);
+    select_fence_with(d, space, &ix, fence)
+}
+
+pub(crate) fn select_fence_with(d: &Drawing, space: &Space, ix: &Option<std::sync::Arc<SpatialIndex>>, fence: &[Vec2]) -> Vec<Handle> {
     let fb = Bounds2::from_points(fence.iter().copied());
     let tol = (fb.width() + fb.height()).max(1e-9) / 2000.0;
+    let probe = fb.expand(tol);
+    let Some(cands) = candidates(d, space, ix, &probe, false, false) else { return Vec::new() };
     let mut out = Vec::new();
-    for e in store.iter() {
-        if !selectable(d, e) || !entity_bounds(d, e, 0).intersects(&fb.expand(tol)) {
+    for (e, known) in cands {
+        if !selectable(d, e) || !bounds_of(d, e, known).intersects(&probe) {
             continue;
         }
         let polys = hit_polylines(d, e, tol);

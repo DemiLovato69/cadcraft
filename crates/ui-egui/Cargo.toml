@@ -15,7 +15,13 @@ cadcraft-doc = { workspace = true }
 cadcraft-render = { workspace = true }
 cadcraft-engine = { workspace = true }
 egui = { workspace = true }
+# GPU canvas paint callback (same egui-wgpu/wgpu eframe uses with its "wgpu" feature).
+egui-wgpu = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
 image = { workspace = true }
+
+[dev-dependencies]
+# Validates the canvas WGSL and its GLSL ES 3.0 (WebGL2) translation in tests (same naga wgpu uses).
+naga = { version = "30", features = ["wgsl-in", "glsl-out"] }

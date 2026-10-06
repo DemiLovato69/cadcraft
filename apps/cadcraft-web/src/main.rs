@@ -35,6 +35,7 @@ mod web {
         cadcraft_engine::cmd::file::set_io(cadcraft_engine::cmd::file::IoHooks {
             read: |b, name| cadcraft_io::read(b, name).map_err(|e| e.to_string()),
             write: |d, name| cadcraft_io::write(d, name).map_err(|e| e.to_string()),
+            plot: Some(|d, space, opts| cadcraft_io::plot(d, space, opts).map_err(|e| e.to_string())),
         });
         wasm_bindgen_futures::spawn_local(async {
             let Some(document) = web_sys::window().and_then(|w| w.document()) else { return };
@@ -52,8 +53,11 @@ mod web {
                 .start(
                     canvas,
                     options,
-                    Box::new(move |_cc| {
+                    Box::new(move |cc| {
                         let mut app = CadApp::new(Session::new(), Services::default());
+                        if let Some(rs) = &cc.wgpu_render_state {
+                            app.set_wgpu(rs);
+                        }
                         if query().contains("sample") {
                             let _ = app.run("ui.sample", serde_json::json!({}));
                         }

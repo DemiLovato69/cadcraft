@@ -1,6 +1,6 @@
 //! Object snaps (OSNAP), polar tracking and ortho.
 
-use cadcraft_doc::{Drawing, EntityKind, Prim, Space, entity_bounds};
+use cadcraft_doc::{Drawing, EntityKind, Prim, Space};
 use cadcraft_geom::{Bounds2, Circle, PI, Segment, Vec2, intersect_ext};
 use serde::Serialize;
 
@@ -79,17 +79,32 @@ pub fn osnap(d: &Drawing, space: &Space, cursor: Vec2, aperture: f64, osmode: u3
     if osmode == 0 || osmode & mode::OFF != 0 {
         return None;
     }
-    let store = d.space(space)?;
+    let ix = crate::spatial::index(d, space);
+    osnap_with(d, space, &ix, cursor, aperture, osmode, base)
+}
+
+pub(crate) fn osnap_with(
+    d: &Drawing,
+    space: &Space,
+    ix: &Option<std::sync::Arc<crate::spatial::SpatialIndex>>,
+    cursor: Vec2,
+    aperture: f64,
+    osmode: u32,
+    base: Option<Vec2>,
+) -> Option<SnapHit> {
+    if osmode == 0 || osmode & mode::OFF != 0 {
+        return None;
+    }
     let probe = Bounds2::new(cursor, cursor).expand(aperture);
     let mut cands: Vec<(u32, Vec2)> = Vec::new();
     let mut near_prims: Vec<Prim> = Vec::new();
     let mut count = 0usize;
-    for e in store.iter() {
+    for (e, known) in crate::select::candidates(d, space, ix, &probe.expand(aperture), true, false)? {
         if !d.is_visible(e) {
             continue;
         }
-        let inf = matches!(e.kind, EntityKind::XLine(_) | EntityKind::Ray(_));
-        if !inf && !entity_bounds(d, e, 0).expand(aperture).intersects(&probe) {
+        let inf = crate::select::is_infinite(e);
+        if !inf && !crate::select::bounds_of(d, e, known).expand(aperture).intersects(&probe) {
             continue;
         }
         count += 1;

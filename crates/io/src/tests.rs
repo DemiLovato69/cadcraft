@@ -219,3 +219,142 @@ fn svg_and_png_export() {
     let png = write(&d, "a.png").unwrap();
     assert_eq!(&png[1..4], b"PNG");
 }
+
+/// Structural sanity check of a PDF: header, object count, xref offsets pointing at `n 0 obj`.
+fn check_pdf(bytes: &[u8]) -> String {
+    assert!(bytes.starts_with(b"%PDF-1.4"));
+    let find = |pat: &[u8]| bytes.windows(pat.len()).position(|w| w == pat);
+    let rfind = |pat: &[u8]| bytes.windows(pat.len()).rposition(|w| w == pat);
+    let tail = String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(64)..]).to_string();
+    assert!(tail.trim_end().ends_with("%%EOF"));
+    let sx = rfind(b"startxref\n").unwrap();
+    let after = String::from_utf8_lossy(&bytes[sx + 10..]).to_string();
+    let xref_off: usize = after.lines().next().unwrap().trim().parse().unwrap();
+    assert!(bytes[xref_off..].starts_with(b"xref\n"));
+    let xref = String::from_utf8_lossy(&bytes[xref_off..]).to_string();
+    let mut lines = xref.lines().skip(1);
+    let count: usize = lines.next().unwrap().split_whitespace().nth(1).unwrap().parse().unwrap();
+    let objs = bytes.windows(7).filter(|w| w == b" 0 obj\n").count();
+    assert_eq!(count, objs + 1, "xref size = objects + free entry");
+    assert_eq!(bytes.windows(6).filter(|w| w == b"endobj").count(), objs);
+    let entries: Vec<&str> = lines.take(count).collect();
+    assert!(entries[0].starts_with("0000000000 65535 f"));
+    for (i, e) in entries.iter().enumerate().skip(1) {
+        let off: usize = e[..10].parse().unwrap();
+        assert!(bytes[off..].starts_with(format!("{i} 0 obj").as_bytes()), "object {i} offset");
+    }
+    assert!(xref.contains(&format!("/Size {count}")));
+    // The content stream's /Length matches its data.
+    let sp = find(b"/Length ").unwrap();
+    let after = String::from_utf8_lossy(&bytes[sp + 8..sp + 30]).to_string();
+    let len: usize = after.split(|c: char| !c.is_ascii_digit()).next().unwrap().parse().unwrap();
+    let start = find(b"stream\n").unwrap() + 7;
+    assert!(bytes[start + len..].starts_with(b"\nendstream"));
+    let compressed = find(b"/FlateDecode").is_some();
+    let data = &bytes[start..start + len];
+    if compressed {
+        String::from_utf8(miniz_oxide::inflate::decompress_to_vec_zlib(data).unwrap()).unwrap()
+    } else {
+        String::from_utf8(data.to_vec()).unwrap()
+    }
+}
+
+fn media_box(bytes: &[u8]) -> (f64, f64) {
+    let text = String::from_utf8_lossy(bytes).to_string();
+    let i = text.find("/MediaBox [0 0 ").unwrap() + 15;
+    let v: Vec<f64> = text[i..].split(']').next().unwrap().split_whitespace().map(|x| x.parse().unwrap()).collect();
+    (v[0], v[1])
+}
+
+#[test]
+fn pdf_model_fitted_to_sheet() {
+    let d = sample();
+    let bytes = plot(&d, &Space::Model, &serde_json::json!({"paper": "A4", "landscape": true})).unwrap();
+    let content = check_pdf(&bytes);
+    let (w, h) = media_box(&bytes);
+    assert!((w - 841.89).abs() < 0.01 && (h - 595.276).abs() < 0.01, "A4 landscape in points: {w} x {h}");
+    assert!(content.contains(" m\n") && content.contains(" l\n") && content.contains("S\n"));
+    // Walls layer is red; colour 7 prints black.
+    assert!(content.contains("1 0 0 RG"));
+    assert!(content.contains("0 0 0 RG"));
+    // Uncompressed output is plain text and also valid.
+    let raw = plot(&d, &Space::Model, &serde_json::json!({"paper": "Letter", "compress": false, "landscape": false})).unwrap();
+    let c2 = check_pdf(&raw);
+    assert!(!String::from_utf8_lossy(&raw).contains("FlateDecode"));
+    assert_eq!(media_box(&raw), (612.0, 792.0));
+    assert!(c2.contains("re W n"));
+    // write() picks PDF by extension.
+    assert!(write(&d, "x.pdf").unwrap().starts_with(b"%PDF"));
+}
+
+#[test]
+fn pdf_layout_one_to_one_with_viewport() {
+    let mut d = sample();
+    let paper = Space::Paper("Layout1".into());
+    d.layouts[0].page.lineweights = true;
+    d.add(
+        &paper,
+        Common::default(),
+        EntityKind::Viewport(Viewport {
+            center: Vec3::new(5.0, 4.0, 0.0),
+            width: 8.0,
+            height: 6.0,
+            view_center: Vec2::new(5.0, 2.5),
+            view_height: 12.0,
+            id: 2,
+            locked: false,
+            frozen_layers: Vec::new(),
+        }),
+    )
+    .unwrap();
+    let bytes = plot(&d, &paper, &serde_json::json!({})).unwrap();
+    let content = check_pdf(&bytes);
+    // ANSI A landscape (inches → points).
+    assert_eq!(media_box(&bytes), (792.0, 612.0));
+    // Viewport border at 1:1: x from 1in to 9in = 72pt..648pt.
+    assert!(content.contains("72 72 m") || content.contains("72 72 l"), "{content}");
+    // Lineweights on: default 0.25 mm = 0.709 pt.
+    assert!(content.contains("0.709 w"));
+    let off = plot(&d, &paper, &serde_json::json!({"lineweights": false})).unwrap();
+    assert!(check_pdf(&off).contains("0 w"));
+    assert!(plot(&d, &Space::Paper("Nope".into()), &serde_json::json!({})).is_err());
+    assert!(plot(&d, &paper, &serde_json::json!({"paper": "Z9"})).is_err());
+}
+
+#[test]
+fn pdf_hostile_options_and_empty() {
+    let d = Drawing::new_metric();
+    let bytes = plot(&d, &Space::Model, &serde_json::json!({})).unwrap();
+    check_pdf(&bytes);
+    let (w, h) = media_box(&bytes);
+    assert!((w - 841.89).abs() < 0.01 && (h - 595.276).abs() < 0.01, "metric default is A4 landscape");
+    let s = sample();
+    for o in [
+        serde_json::json!({"width": 1e308, "height": -5}),
+        serde_json::json!({"width": 1e308, "height": 1e308, "scale": 1e308, "fit": false}),
+        serde_json::json!({"scale": -1, "fit": false, "title": "a(b)\\c\u{e9}"}),
+        serde_json::json!(null),
+        serde_json::json!([1, 2]),
+    ] {
+        check_pdf(&plot(&s, &Space::Model, &o).unwrap());
+    }
+}
+
+#[test]
+fn dxf_roundtrips_page_setup() {
+    let mut d = sample();
+    let a3 = cadcraft_render::paper_size("A3").unwrap();
+    {
+        let p = &mut d.layouts[0].page;
+        p.paper = a3.name.into();
+        p.width_mm = a3.width_mm;
+        p.height_mm = a3.height_mm;
+        p.landscape = false;
+        p.margins_mm = [5.0, 6.0, 7.0, 8.0];
+    }
+    let back = read_dxf(write_dxf(&d).as_bytes()).unwrap();
+    let p = &back.layout("Layout1").unwrap().page;
+    assert_eq!((p.width_mm, p.height_mm, p.landscape), (297.0, 420.0, false));
+    assert_eq!(p.margins_mm, [5.0, 6.0, 7.0, 8.0]);
+    assert_eq!(p.paper, a3.name);
+}

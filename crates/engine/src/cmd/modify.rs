@@ -67,7 +67,7 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("fillet", "Fillet", run_fillet)
             .menu(&["Modify", "Fillet"])
             .alias(&["f"])
-            .params("{h1, p1, h2, p2, radius?}")
+            .params("{h1, p1, h2, p2, radius?} (lines, arcs, circles) | {handle, polyline: true, radius?}")
             .interactive(|s| Ok(Box::new(FilletM::new(s, false)))),
         CommandSpec::new("chamfer", "Chamfer", run_chamfer)
             .menu(&["Modify", "Chamfer"])
@@ -549,7 +549,7 @@ pub(crate) fn trim(s: &mut Session, h: Handle, pick: Vec2, edges: Option<&[Handl
             keep.into_iter().collect()
         }
         EntityKind::LwPolyline(p) => trim_polyline(p, &cut, pick)?,
-        _ => return Err(EngineError::Other("Cannot trim that object.".into())),
+        k => super::modify2::trim_other(k, &cut, pick)?,
     };
     let common = e.common.clone();
     let space = s.space();
@@ -711,7 +711,7 @@ pub(crate) fn extend(s: &mut Session, h: Handle, pick: Vec2, edges: Option<&[Han
             }
             lwpoly(vs, false)
         }
-        _ => return Err(EngineError::Other("Cannot extend that object.".into())),
+        k => super::modify2::extend_other(k, &cut, pick)?,
     };
     s.doc_mut()?.modify_entity(h, |e| e.kind = new_kind)?;
     Ok(())
@@ -760,7 +760,10 @@ pub(crate) fn fillet_lines(
     let e1 = d.entity(h1).map(|e| (**e).clone()).ok_or_else(|| EngineError::Other("no such object".into()))?;
     let e2 = d.entity(h2).map(|e| (**e).clone()).ok_or_else(|| EngineError::Other("no such object".into()))?;
     let (Some(l1), Some(l2)) = (as_line(&e1), as_line(&e2)) else {
-        return Err(EngineError::Other("Fillet/chamfer currently works on lines.".into()));
+        if chamfer.is_none() {
+            return super::modify2::fillet_curves(s, h1, p1, h2, p2, radius);
+        }
+        return Err(EngineError::Other("Chamfer currently works on lines.".into()));
     };
     let (x, _, _) = line_line_infinite(l1.a, l1.b, l2.a, l2.b).ok_or_else(|| EngineError::Other("Lines are parallel.".into()))?;
     // Keep the far end on the picked side of the corner.
@@ -820,6 +823,12 @@ fn h_param(p: &Value, k: &str) -> Option<Handle> {
 }
 
 fn run_fillet(s: &mut Session, p: &Value) -> Result<Value> {
+    if bool_or(p, "polyline", false) {
+        let h = h_param(p, "handle").or_else(|| h_param(p, "h1")).ok_or_else(|| bad("fillet", "`handle` (polyline) is required"))?;
+        let r = f64_or(p, "radius", s.doc()?.header.f64("FILLETRAD", 0.0));
+        let n = super::modify2::fillet_polyline(s, h, r)?;
+        return Ok(json!({ "filleted": n }));
+    }
     let h1 = h_param(p, "h1").ok_or_else(|| bad("fillet", "`h1` is required"))?;
     let h2 = h_param(p, "h2").ok_or_else(|| bad("fillet", "`h2` is required"))?;
     let r = f64_or(p, "radius", s.doc()?.header.f64("FILLETRAD", 0.0));
@@ -1752,11 +1761,12 @@ struct FilletM {
     chamfer: bool,
     first: Option<(Handle, Vec2)>,
     asking: bool,
+    polyline: bool,
 }
 
 impl FilletM {
     fn new(_s: &Session, chamfer: bool) -> Self {
-        FilletM { chamfer, first: None, asking: false }
+        FilletM { chamfer, first: None, asking: false, polyline: false }
     }
 }
 
@@ -1778,6 +1788,9 @@ impl Interactive for FilletM {
     fn prompt(&self, _s: &Session) -> Prompt {
         if self.asking {
             return Prompt::new(if self.chamfer { "Specify first chamfer distance" } else { "Specify fillet radius" }, Accept::NUMBER);
+        }
+        if self.polyline {
+            return Prompt::new("Select 2D polyline", Accept::POINT);
         }
         match (self.first, self.chamfer) {
             (None, false) => Prompt::new("Select first object", Accept::POINT).kw(&["Undo", "Polyline", "Radius", "Trim", "Multiple"]),
@@ -1808,6 +1821,10 @@ impl Interactive for FilletM {
                 self.asking = true;
                 Ok(Step::Continue)
             }
+            Input::Keyword(k) if k == "Polyline" && !self.chamfer => {
+                self.polyline = true;
+                Ok(Step::Continue)
+            }
             Input::Point(p) => {
                 let ap = s.pixel_size() * s.settings.pickbox.max(1.0) * 1.5;
                 let space = s.space();
@@ -1815,6 +1832,12 @@ impl Interactive for FilletM {
                     s.echo("*Invalid selection*");
                     return Ok(Step::Continue);
                 };
+                if self.polyline {
+                    let r = s.doc()?.header.f64("FILLETRAD", 0.0);
+                    let n = super::modify2::fillet_polyline(s, h, r)?;
+                    s.echo(format!("{n} lines were filleted"));
+                    return Ok(Step::Done);
+                }
                 match self.first {
                     None => {
                         self.first = Some((h, p));

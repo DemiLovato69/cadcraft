@@ -6,6 +6,7 @@
 //! cadcraft-cli run [FILE|--sample|--metric] [--script TEXT|--script-file F.scr] [--cmd 'id {json}']... [--save OUT] [--export OUT.png]
 //! cadcraft-cli commands [FILTER]                   command catalog (JSON)
 //! cadcraft-cli mcp [--connect HOST:PORT]           MCP server on stdio (headless or bridged to the app)
+//! cadcraft-cli perf [N]                            timing table on a synthetic N-entity drawing
 //! ```
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
@@ -20,12 +21,14 @@ const USAGE: &str = "usage:
   cadcraft-cli run [FILE | --sample | --metric] [--script TEXT] [--script-file F.scr] [--cmd 'id {json}']... [--save OUT.dxf] [--export OUT.(png|svg)]
   cadcraft-cli commands [FILTER]
   cadcraft-cli mcp [--connect HOST:PORT]
+  cadcraft-cli perf [N]
   cadcraft-cli --version";
 
 fn install_io() {
     cadcraft_engine::cmd::file::set_io(cadcraft_engine::cmd::file::IoHooks {
         read: |b, name| cadcraft_io::read(b, name).map_err(|e| e.to_string()),
         write: |d, name| cadcraft_io::write(d, name).map_err(|e| e.to_string()),
+        plot: Some(|d, space, opts| cadcraft_io::plot(d, space, opts).map_err(|e| e.to_string())),
     });
 }
 
@@ -103,6 +106,140 @@ fn run(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Small deterministic generator (xorshift64*) so perf runs are repeatable without a dependency.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> f64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        (self.0.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
+    }
+    fn range(&mut self, lo: f64, hi: f64) -> f64 {
+        lo + (hi - lo) * self.next()
+    }
+}
+
+/// A synthetic drawing with `n` mixed entities (lines, circles, arcs, polylines, text) spread
+/// over a square whose side grows with sqrt(n), so density stays constant.
+fn synthetic(n: usize, side: f64) -> Result<cadcraft_engine::doc::Drawing, String> {
+    use cadcraft_engine::doc::{self as d, Common, EntityKind, Space};
+    use cadcraft_engine::geom::{PolyVertex, Vec2, Vec3};
+    let mut dr = d::Drawing::new_imperial();
+    let mut r = Rng(0x9E37_79B9_7F4A_7C15);
+    let v3 = |x: f64, y: f64| Vec3::new(x, y, 0.0);
+    for i in 0..n {
+        let (x, y) = (r.range(0.0, side), r.range(0.0, side));
+        let s = r.range(0.5, 8.0);
+        let kind = match i % 5 {
+            0 => EntityKind::Line(d::Line { a: v3(x, y), b: v3(x + r.range(-s, s), y + r.range(-s, s)) }),
+            1 => EntityKind::Circle(d::Circle { center: v3(x, y), radius: s * 0.5 }),
+            2 => EntityKind::Arc(d::Arc { center: v3(x, y), radius: s * 0.5, start: r.range(0.0, 3.0), end: r.range(3.2, 6.2) }),
+            3 => EntityKind::LwPolyline(d::LwPolyline {
+                vertices: (0..6)
+                    .map(|k| PolyVertex {
+                        p: Vec2::new(x + f64::from(k) * s * 0.3, y + r.range(-s, s) * 0.3),
+                        bulge: if k == 2 { 0.4 } else { 0.0 },
+                        start_width: 0.0,
+                        end_width: 0.0,
+                    })
+                    .collect(),
+                closed: i % 2 == 0,
+                const_width: 0.0,
+                elevation: 0.0,
+                plinegen: false,
+            }),
+            _ => EntityKind::Text(d::Text {
+                insert: v3(x, y),
+                align_pt: None,
+                height: s * 0.2,
+                value: format!("T{i}"),
+                rotation: 0.0,
+                width_factor: 1.0,
+                oblique: 0.0,
+                style: "Standard".into(),
+                halign: d::HAlign::Left,
+                valign: d::VAlign::Baseline,
+            }),
+        };
+        dr.add(&Space::Model, Common::default(), kind).map_err(|e| e.to_string())?;
+    }
+    Ok(dr)
+}
+
+fn perf(args: &[String]) -> Result<(), String> {
+    use cadcraft_engine::doc::Space;
+    use cadcraft_engine::geom::{Bounds2, Vec2};
+    use cadcraft_engine::{select, snap};
+    use std::time::Instant;
+    let n: usize = match args.first() {
+        Some(a) => a.parse().map_err(|_| format!("perf: bad entity count {a}"))?,
+        None => 200_000,
+    };
+    let n = n.clamp(1, 20_000_000);
+    let side = (n as f64).sqrt() * 10.0;
+    let mut rows: Vec<(String, f64, String)> = Vec::new();
+    let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.0;
+
+    let t = Instant::now();
+    let d = synthetic(n, side)?;
+    rows.push(("build synthetic drawing".into(), ms(t), format!("{n} entities")));
+
+    // Display list at a 1600 px wide "zoom extents" view (tolerance = half a pixel).
+    let px = side / 1600.0;
+    let opts = cadcraft_engine::render::Options { tolerance: px * 0.5, min_dash: px * 2.0, ..Default::default() };
+    let t = Instant::now();
+    let list = cadcraft_engine::render::build(&d, &Space::Model, &opts);
+    rows.push(("display list build".into(), ms(t), format!("{} prims, {} segments", list.prims.len(), list.segment_count())));
+
+    // Hit testing on a zoomed-in view (aperture = 5 px at 0.02 units/px).
+    let ap = 0.1;
+    let mut r = Rng(42);
+    let pts: Vec<Vec2> = (0..1000).map(|_| Vec2::new(r.range(0.0, side), r.range(0.0, side))).collect();
+    let t = Instant::now();
+    let first = select::pick(&d, &Space::Model, pts.first().copied().unwrap_or(Vec2::ZERO), ap);
+    rows.push(("first pick (incl. index build)".into(), ms(t), format!("{first:?}")));
+    let t = Instant::now();
+    let hits = pts.iter().filter(|p| select::pick(&d, &Space::Model, **p, ap).is_some()).count();
+    let total = ms(t);
+    rows.push(("pick x1000".into(), total, format!("{hits} hits, {:.3} ms/pick", total / 1000.0)));
+
+    let mut sel = 0usize;
+    let t = Instant::now();
+    for k in 0..20 {
+        let c = Vec2::new(r.range(0.0, side), r.range(0.0, side));
+        let half = side * 0.05;
+        sel += select::select_window(&d, &Space::Model, Bounds2::new(c - Vec2::new(half, half), c + Vec2::new(half, half)), k % 2 == 1).len();
+    }
+    rows.push(("window/crossing select x20 (10% side)".into(), ms(t), format!("{sel} selected")));
+
+    let t = Instant::now();
+    let fence: Vec<Vec2> = (0..4).map(|_| Vec2::new(r.range(0.0, side), r.range(0.0, side))).collect();
+    let fsel = select::select_fence(&d, &Space::Model, &fence).len();
+    rows.push(("fence select (3 legs)".into(), ms(t), format!("{fsel} selected")));
+
+    let osmode = snap::mode::END | snap::mode::MID | snap::mode::CEN | snap::mode::QUA | snap::mode::INT;
+    let t = Instant::now();
+    let snaps = pts.iter().filter(|p| snap::osnap(&d, &Space::Model, **p, ap * 2.0, osmode, None).is_some()).count();
+    let total = ms(t);
+    rows.push(("osnap x1000".into(), total, format!("{snaps} hits, {:.3} ms/query", total / 1000.0)));
+
+    let t = Instant::now();
+    let bytes = cadcraft_io::write(&d, "perf.dxf").map_err(|e| e.to_string())?;
+    rows.push(("DXF write".into(), ms(t), format!("{:.1} MB", bytes.len() as f64 / 1e6)));
+    let t = Instant::now();
+    let back = cadcraft_io::read(&bytes, "perf.dxf").map_err(|e| e.to_string())?;
+    rows.push(("DXF read".into(), ms(t), format!("{} entities", back.entity_count())));
+
+    println!("{:<40} {:>12}  notes", "operation", "ms");
+    println!("{}", "-".repeat(80));
+    for (name, t, note) in rows {
+        println!("{name:<40} {t:>12.2}  {note}");
+    }
+    Ok(())
+}
+
 fn main() -> ExitCode {
     install_io();
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -117,6 +254,7 @@ fn main() -> ExitCode {
             _ => Err(USAGE.into()),
         },
         Some("run") => run(&rest),
+        Some("perf") => perf(&rest),
         Some("commands") => {
             let s = Session::new();
             let f = rest.first().map(|x| x.to_ascii_lowercase());

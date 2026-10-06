@@ -674,7 +674,7 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
     d.layouts.clear();
     let mut block_records: HashMap<String, String> = HashMap::new();
     let mut blocks: Vec<(String, Vec3, Vec<(Option<String>, bool, Entity)>, bool)> = Vec::new();
-    let mut layout_objs: Vec<(String, u32, String)> = Vec::new();
+    let mut layout_objs: Vec<(String, u32, String, PageSetup)> = Vec::new();
     let mut entities = Vec::new();
     for s in &secs {
         match s.name.as_str() {
@@ -712,7 +712,8 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
                         let t = T(tail);
                         // LAYOUT has two 330s: owner dict and the block record; take the last.
                         let br = tg.iter().rfind(|x| x.code == 330).map(Tag::str).unwrap_or_default();
-                        layout_objs.push((t.s(1).unwrap_or_default(), t.i(71).unwrap_or(0) as u32, br.to_ascii_uppercase()));
+                        let plot = T(tg.get(..start).unwrap_or(&[]));
+                        layout_objs.push((t.s(1).unwrap_or_default(), t.i(71).unwrap_or(0) as u32, br.to_ascii_uppercase(), page_setup(&plot)));
                     }
                 }
             }
@@ -722,11 +723,11 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
     // Layouts.
     let mut paper_block_for: HashMap<String, String> = HashMap::new();
     layout_objs.sort_by_key(|l| l.1);
-    for (name, order, br) in &layout_objs {
+    for (name, order, br, page) in &layout_objs {
         if name.eq_ignore_ascii_case("Model") {
             continue;
         }
-        d.layouts.push(Layout::new(name, *order));
+        d.layouts.push(Layout { page: page.clone(), ..Layout::new(name, *order) });
         if let Some(bname) = block_records.get(br) {
             paper_block_for.insert(bname.to_ascii_uppercase(), name.clone());
         }
@@ -788,4 +789,31 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
         d.layers.insert(0, Layer::default());
     }
     Ok(d)
+}
+
+/// Page setup from a LAYOUT object's AcDbPlotSettings fields (sizes and margins in mm).
+fn page_setup(t: &T) -> PageSetup {
+    let mut p = PageSetup::default();
+    let mm = |code: i32, d: f64| {
+        let v = t.fd(code, d);
+        if v.is_finite() && (0.0..=100_000.0).contains(&v) { v } else { d }
+    };
+    let (w, h) = (mm(44, 0.0), mm(45, 0.0));
+    if w > 0.0 && h > 0.0 {
+        p.width_mm = w.min(h);
+        p.height_mm = w.max(h);
+    }
+    p.margins_mm = [mm(40, p.margins_mm[0]), mm(41, p.margins_mm[1]), mm(42, p.margins_mm[2]), mm(43, p.margins_mm[3])];
+    // Plot rotation 1 or 3 turns the media a quarter turn; media defined wider than tall is
+    // already landscape.
+    let rotated = matches!(t.i(73), Some(1 | 3));
+    if w > 0.0 && h > 0.0 {
+        p.landscape = rotated != (w > h);
+    } else if t.i(73).is_some() {
+        p.landscape = rotated;
+    }
+    if let Some(name) = t.s(4).filter(|n| !n.is_empty()) {
+        p.paper = name.replace('_', " ");
+    }
+    p
 }

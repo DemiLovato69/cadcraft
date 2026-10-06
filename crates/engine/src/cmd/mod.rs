@@ -4,16 +4,22 @@
 mod annotate;
 mod blocks;
 mod draw;
+mod draw2;
 mod edit;
 pub mod file;
+mod gripcmds;
 mod hatch;
 mod inquiry;
 mod layer;
+mod layout;
 mod modify;
+mod modify2;
 mod props;
 mod settings;
+mod utility;
 mod view;
 
+pub mod curves;
 pub mod helpers;
 pub mod machines;
 
@@ -142,14 +148,19 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(edit::specs());
         v.extend(view::specs());
         v.extend(draw::specs());
+        v.extend(draw2::specs());
         v.extend(annotate::specs());
         v.extend(hatch::specs());
         v.extend(blocks::specs());
         v.extend(modify::specs());
+        v.extend(modify2::specs());
+        v.extend(gripcmds::specs());
         v.extend(layer::specs());
+        v.extend(layout::specs());
         v.extend(props::specs());
         v.extend(inquiry::specs());
         v.extend(settings::specs());
+        v.extend(utility::specs());
         v
     })
 }

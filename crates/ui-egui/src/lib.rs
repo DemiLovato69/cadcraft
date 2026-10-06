@@ -8,11 +8,13 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
+pub mod about;
 pub mod canvas;
 pub mod chrome;
 pub mod cmdline;
 pub mod control;
 pub mod dialogs;
+pub mod gpu;
 pub mod icons;
 pub mod menus;
 pub mod palettes;
@@ -117,6 +119,12 @@ impl CadApp {
             frame_ms: 0.0,
             quit_requested: false,
         }
+    }
+
+    /// Draw the canvas on the GPU with the app's wgpu render state (eframe's
+    /// `CreationContext::wgpu_render_state`). Without it the canvas draws on the CPU.
+    pub fn set_wgpu(&mut self, rs: &egui_wgpu::RenderState) {
+        self.canvas.gpu = Some(gpu::install(rs));
     }
 
     pub fn with_control(mut self, rx: Receiver<ControlRequest>) -> Self {

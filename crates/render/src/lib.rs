@@ -7,10 +7,12 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
+pub mod clip;
 mod dim;
 mod fill;
 mod hatch;
 mod linetype;
+pub mod paper;
 pub mod raster;
 
 use cadcraft_color::{Color, Rgb};
@@ -19,6 +21,11 @@ use cadcraft_geom::{Bounds2, Mat3, Polyline, Vec2};
 
 pub use dim::dimension_geometry;
 pub use fill::triangulate_evenodd;
+pub use paper::{PAPER_SIZES, PaperSize, Sheet, paper_size, sheet};
+
+/// Handle carried by model-space geometry drawn inside a paper-space viewport (it belongs to no
+/// single paper-space entity, so selection highlighting never matches it).
+pub const VIEWPORT_CONTENT: Handle = Handle(0);
 
 /// What a display-list primitive draws.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -50,6 +57,9 @@ pub struct DisplayList {
     pub verts: Vec<Vec2>,
     pub tris: Vec<Vec2>,
     pub bounds: Bounds2,
+    /// The paper sheet when the list was built for a layout (paper space); the UI draws the
+    /// white sheet, its shadow and the printable-area outline from it.
+    pub sheet: Option<Sheet>,
 }
 
 impl DisplayList {
@@ -96,11 +106,15 @@ struct Ctx<'a> {
     block_ltype: String,
     depth: usize,
     top: Handle,
+    /// Layers frozen in the viewport being drawn.
+    frozen: &'a [String],
 }
 
 struct Builder<'a> {
     list: DisplayList,
     opts: &'a Options,
+    /// Plotting: skip layers marked "do not plot".
+    plotting: bool,
 }
 
 impl Builder<'_> {
@@ -143,52 +157,166 @@ impl Builder<'_> {
     }
 }
 
-/// Build the display list for a space.
+/// Build the display list for a space. For a layout (paper space) this includes the model-space
+/// geometry seen through each viewport, clipped to the viewport, and [`DisplayList::sheet`].
 pub fn build(d: &Drawing, space: &Space, opts: &Options) -> DisplayList {
-    let mut b = Builder { list: DisplayList::default(), opts };
+    build_space(d, space, opts, false)
+}
+
+/// Like [`build`] but for plotting: layers marked "do not plot" (such as `Defpoints`) are left out.
+pub fn build_plot(d: &Drawing, space: &Space, opts: &Options) -> DisplayList {
+    build_space(d, space, opts, true)
+}
+
+fn top_ctx<'a>(d: &'a Drawing, xf: Mat3, top: Handle, frozen: &'a [String]) -> Ctx<'a> {
+    Ctx {
+        d,
+        xf,
+        block_color: Color::Index(7),
+        block_layer: None,
+        block_lw: Lineweight::Default,
+        block_ltype: "Continuous".into(),
+        depth: 0,
+        top,
+        frozen,
+    }
+}
+
+fn build_space(d: &Drawing, space: &Space, opts: &Options, plotting: bool) -> DisplayList {
+    let mut b = Builder { list: DisplayList::default(), opts, plotting };
+    if let Space::Paper(name) = space {
+        b.list.sheet = paper::sheet(d, name);
+    }
     if let Some(store) = d.space(space) {
+        let paper = matches!(space, Space::Paper(_));
+        let mut viewports = 0usize;
         for e in store.iter() {
-            let ctx = Ctx {
-                d,
-                xf: Mat3::IDENTITY,
-                block_color: Color::Index(7),
-                block_layer: None,
-                block_lw: Lineweight::Default,
-                block_ltype: "Continuous".into(),
-                depth: 0,
-                top: e.handle,
-            };
-            entity(&mut b, &ctx, e);
+            if paper && let EntityKind::Viewport(vp) = &e.kind {
+                if viewports < MAX_VIEWPORTS {
+                    viewports += 1;
+                    viewport(&mut b, d, e, vp);
+                }
+                continue;
+            }
+            entity(&mut b, &top_ctx(d, Mat3::IDENTITY, e.handle, &[]), e);
         }
     }
     b.list
 }
 
+/// Upper bound on viewports drawn per layout (hostile files).
+const MAX_VIEWPORTS: usize = 256;
+
+/// A paper-space viewport: its border (as an ordinary entity) and model space seen through it.
+/// Viewport id 1 is the paper-space view itself and is not drawn.
+fn viewport(b: &mut Builder, d: &Drawing, e: &Entity, vp: &cadcraft_doc::Viewport) {
+    if vp.id == 1 || !e.common.visible {
+        return;
+    }
+    // Border (on the viewport's layer; layer off hides only the border).
+    entity(b, &top_ctx(d, Mat3::IDENTITY, e.handle, &[]), e);
+    let center = vp.center.xy();
+    let ok = |v: f64| v.is_finite() && v > 0.0;
+    if !(ok(vp.width) && ok(vp.height) && ok(vp.view_height) && center.is_finite() && vp.view_center.is_finite()) {
+        return;
+    }
+    let s = vp.height / vp.view_height;
+    if !ok(s) {
+        return;
+    }
+    let half = Vec2::new(vp.width / 2.0, vp.height / 2.0);
+    let rect = Bounds2::new(center - half, center + half);
+    let xf = Mat3::translate(center).then_before(Mat3::scale(s, s)).then_before(Mat3::translate(-vp.view_center));
+    let mhalf = half / s;
+    // Model window with slack: entity bounds are approximate (text, dimensions).
+    let win = Bounds2::new(vp.view_center - mhalf, vp.view_center + mhalf).expand(mhalf.x.max(mhalf.y) * 0.1);
+    let mut sub = Builder { list: DisplayList::default(), opts: b.opts, plotting: b.plotting };
+    for me in d.model.iter() {
+        if !matches!(me.kind, EntityKind::Ray(_) | EntityKind::XLine(_) | EntityKind::Viewport(_)) {
+            let eb = cadcraft_doc::entity_bounds(d, me, 0);
+            if !eb.is_empty() && !eb.intersects(&win) {
+                continue;
+            }
+        }
+        if matches!(me.kind, EntityKind::Viewport(_)) {
+            continue;
+        }
+        entity(&mut sub, &top_ctx(d, xf, VIEWPORT_CONTENT, &vp.frozen_layers), me);
+    }
+    append_clipped(&mut b.list, &sub.list, &rect);
+}
+
+/// Append `src` to `dst`, clipped to `rect`.
+fn append_clipped(dst: &mut DisplayList, src: &DisplayList, rect: &Bounds2) {
+    for p in &src.prims {
+        let pts = src.points(p);
+        match p.kind {
+            Kind::Polyline => {
+                for piece in clip::clip_polyline(pts, rect) {
+                    push_raw(dst, p, Kind::Polyline, &piece);
+                }
+            }
+            Kind::Tris => {
+                let t = clip::clip_triangles(pts, rect);
+                push_raw(dst, p, Kind::Tris, &t);
+            }
+            Kind::Point => {
+                if let Some(q) = pts.first()
+                    && rect.contains(*q)
+                {
+                    push_raw(dst, p, Kind::Point, &[*q]);
+                }
+            }
+            Kind::Infinite { ray } => {
+                if let (Some(base), Some(dir)) = (pts.first(), pts.get(1))
+                    && let Some((a, c)) = clip::clip_infinite(*base, *dir, ray, rect)
+                {
+                    push_raw(dst, p, Kind::Polyline, &[a, c]);
+                }
+            }
+        }
+    }
+}
+
+fn push_raw(dst: &mut DisplayList, p: &DPrim, kind: Kind, pts: &[Vec2]) {
+    let min = match kind {
+        Kind::Polyline => 2,
+        Kind::Tris => 3,
+        _ => 1,
+    };
+    if pts.len() < min {
+        return;
+    }
+    let tris = kind == Kind::Tris;
+    let start = if tris { dst.tris.len() } else { dst.verts.len() } as u32;
+    for q in pts {
+        dst.bounds.add(*q);
+    }
+    if tris {
+        dst.tris.extend_from_slice(pts);
+    } else {
+        dst.verts.extend_from_slice(pts);
+    }
+    dst.prims.push(DPrim { handle: p.handle, color: p.color, lw: p.lw, kind, start, len: pts.len() as u32 });
+}
+
 /// Build the display list for a set of loose entities (previews, rubber bands).
 pub fn build_entities<'a, I: IntoIterator<Item = &'a Entity>>(d: &Drawing, ents: I, opts: &Options) -> DisplayList {
-    let mut b = Builder { list: DisplayList::default(), opts };
+    let mut b = Builder { list: DisplayList::default(), opts, plotting: false };
     for e in ents {
-        let ctx = Ctx {
-            d,
-            xf: Mat3::IDENTITY,
-            block_color: Color::Index(7),
-            block_layer: None,
-            block_lw: Lineweight::Default,
-            block_ltype: "Continuous".into(),
-            depth: 0,
-            top: e.handle,
-        };
-        entity(&mut b, &ctx, e);
+        entity(&mut b, &top_ctx(d, Mat3::IDENTITY, e.handle, &[]), e);
     }
     b.list
 }
 
-fn resolve(ctx: &Ctx, e: &Entity) -> (Rgb, f32, Option<cadcraft_doc::Linetype>, f64, bool) {
+fn resolve(ctx: &Ctx, e: &Entity, plotting: bool) -> (Rgb, f32, Option<cadcraft_doc::Linetype>, f64, bool) {
     let d = ctx.d;
     // Layer "0" inside a block takes the insert's layer.
     let layer_name = if e.common.layer == "0" { ctx.block_layer.as_deref().unwrap_or("0") } else { e.common.layer.as_str() };
     let layer = d.layer(layer_name);
-    let visible = e.common.visible && layer.is_none_or(|l| l.visible());
+    let visible = e.common.visible
+        && layer.is_none_or(|l| l.visible() && (!plotting || l.plot))
+        && !ctx.frozen.iter().any(|f| f.eq_ignore_ascii_case(layer_name));
     let layer_color = layer.map(|l| l.color).unwrap_or(Color::Index(7));
     let rgb = e.common.color.resolve(layer_color, ctx.block_color);
     let lw = match e.common.lineweight {
@@ -211,7 +339,7 @@ fn resolve(ctx: &Ctx, e: &Entity) -> (Rgb, f32, Option<cadcraft_doc::Linetype>, 
 }
 
 fn entity(b: &mut Builder, ctx: &Ctx, e: &Entity) {
-    let (rgb, lw, lt, ltscale, visible) = resolve(ctx, e);
+    let (rgb, lw, lt, ltscale, visible) = resolve(ctx, e, b.plotting);
     if !visible {
         return;
     }
@@ -511,6 +639,7 @@ fn sub_ctx<'a>(ctx: &Ctx<'a>, e: &Entity, m: Mat3) -> Ctx<'a> {
         block_ltype: lt,
         depth: ctx.depth + 1,
         top: ctx.top,
+        frozen: ctx.frozen,
     }
 }
 

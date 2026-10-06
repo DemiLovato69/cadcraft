@@ -38,7 +38,17 @@ impl Xf {
 #[derive(Default)]
 pub struct CanvasState {
     pub list: Option<DisplayList>,
-    key: (u64, u64, i32),
+    key: (u64, u64, i32, bool),
+    /// Set when the app runs on wgpu: entities are drawn by [`crate::gpu`]; otherwise on the CPU.
+    pub gpu: Option<crate::gpu::GpuTarget>,
+    /// The mesh last handed to the GPU (see [`crate::gpu::CanvasCallback::key`]).
+    mesh_key: Option<u64>,
+    mesh_slot: crate::gpu::MeshSlot,
+    mesh_origin: Vec2,
+    /// Indices of infinite-line primitives in `list` (drawn on the CPU in GPU mode).
+    infinite: Vec<usize>,
+    /// Milliseconds spent converting the display list to vertex data (last rebuild).
+    pub mesh_ms: f64,
     pub rect: Option<Rect>,
     pub xf: Option<Xf>,
     pub hover: Option<Handle>,
@@ -62,7 +72,7 @@ fn ensure_list(app: &mut CadApp, px: f64) {
     let Ok(st) = app.session.state() else { return };
     // Rebuild when the drawing changes or the zoom moves by more than 2x (tessellation band).
     let band = px.max(1e-300).log2().floor() as i32;
-    let key = (st.uid, st.revision, band);
+    let key = (st.uid, st.revision, band, app.session.settings.lwdisplay);
     if app.canvas.list.is_some() && app.canvas.key == key {
         return;
     }
@@ -203,6 +213,51 @@ fn draw_list(p: &egui::Painter, xf: &Xf, list: &DisplayList, bg: Rgb, lwdisplay:
                     shapes.push(Shape::line_segment(seg, Stroke::new(1.0, col)));
                 }
             }
+        }
+    }
+    p.extend(shapes);
+}
+
+/// Draw the display list through the GPU paint callback (uploading it when it changed), plus
+/// the infinite lines, which are clipped to the view on the CPU every frame.
+fn draw_list_gpu(c: &mut CanvasState, p: &egui::Painter, xf: &Xf, bg: Rgb, lwdisplay: bool) {
+    let Some(list) = &c.list else { return };
+    let origin = crate::gpu::choose_origin(&list.bounds, xf.center, f64::from(xf.rect.height()) / xf.scale.max(1e-300));
+    let key = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (c.key, origin.x.to_bits(), origin.y.to_bits(), bg.0, bg.1, bg.2, lwdisplay).hash(&mut h);
+        h.finish()
+    };
+    if c.mesh_key != Some(key) {
+        let t0 = crate::now_ms();
+        let mesh = crate::gpu::build_mesh(list, origin, bg, lwdisplay);
+        if let Ok(mut slot) = c.mesh_slot.lock() {
+            *slot = Some(mesh);
+        }
+        c.infinite = list.prims.iter().enumerate().filter(|(_, pr)| matches!(pr.kind, Kind::Infinite { .. })).map(|(i, _)| i).collect();
+        c.mesh_key = Some(key);
+        c.mesh_origin = origin;
+        c.mesh_ms = crate::now_ms() - t0;
+    }
+    let center = xf.rect.center();
+    p.add(egui_wgpu::Callback::new_paint_callback(
+        xf.rect,
+        crate::gpu::CanvasCallback {
+            key,
+            slot: c.mesh_slot.clone(),
+            offset: [(c.mesh_origin.x - xf.center.x) as f32, (c.mesh_origin.y - xf.center.y) as f32],
+            scale: xf.scale as f32,
+            center: [center.x, center.y],
+        },
+    ));
+    let mut shapes = Vec::new();
+    for prim in c.infinite.iter().filter_map(|i| list.prims.get(*i)) {
+        let pts = list.points(prim);
+        if let (Kind::Infinite { ray }, Some(b), Some(d)) = (prim.kind, pts.first(), pts.get(1))
+            && let Some(seg) = clip_infinite(xf, *b, *d, ray)
+        {
+            shapes.push(Shape::line_segment(seg, Stroke::new(1.0, color32(display_rgb(prim.color, bg)))));
         }
     }
     p.extend(shapes);
@@ -476,8 +531,12 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     ensure_list(app, 1.0 / scale);
     let bg = Rgb(t.canvas.r(), t.canvas.g(), t.canvas.b());
     let sel = app.session.selection();
-    if let Some(list) = &app.canvas.list {
+    if app.canvas.gpu.is_some() {
+        draw_list_gpu(&mut app.canvas, &painter, &xf, bg, app.session.settings.lwdisplay);
+    } else if let Some(list) = &app.canvas.list {
         draw_list(&painter, &xf, list, bg, app.session.settings.lwdisplay);
+    }
+    if let Some(list) = &app.canvas.list {
         if let Some(h) = app.canvas.hover
             && !sel.contains(&h)
         {

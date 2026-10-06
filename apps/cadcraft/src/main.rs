@@ -46,6 +46,7 @@ pub fn install_io() {
     cadcraft_engine::cmd::file::set_io(cadcraft_engine::cmd::file::IoHooks {
         read: |b, name| cadcraft_io::read(b, name).map_err(|e| e.to_string()),
         write: |d, name| cadcraft_io::write(d, name).map_err(|e| e.to_string()),
+        plot: Some(|d, space, opts| cadcraft_io::plot(d, space, opts).map_err(|e| e.to_string())),
     });
 }
 
@@ -120,6 +121,9 @@ fn main() -> eframe::Result {
         Box::new(move |cc| {
             let mut app = CadApp::new(Session::empty(), services());
             app.integrated_titlebar = cfg!(target_os = "macos");
+            if let Some(rs) = &cc.wgpu_render_state {
+                app.set_wgpu(rs);
+            }
             if let Some(port) = control_port {
                 let rx = control_server::start(port, cc.egui_ctx.clone());
                 app = app.with_control(rx);
