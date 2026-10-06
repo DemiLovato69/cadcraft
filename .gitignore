@@ -8,3 +8,4 @@
 .DS_Store
 *.swp
 /apps/cadcraft-web/dist/
+/.claude/worktrees/
