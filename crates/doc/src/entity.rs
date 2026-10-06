@@ -329,6 +329,49 @@ pub struct Dimension {
     /// Anonymous block with the rendered geometry (from files); regenerated when edited.
     #[serde(default)]
     pub block: Option<String>,
+    /// Per-dimension style overrides (DIMOVERRIDE): DimStyle field names (camelCase) → values,
+    /// merged over the named style.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub overrides: serde_json::Map<String, serde_json::Value>,
+    /// Associativity: which definition points follow which objects.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assoc: Vec<DimAssoc>,
+}
+
+/// A dimension definition point that follows an object (associative dimensions).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DimAssoc {
+    /// Definition point: "defpt", "p13", "p14", "p15" or "p16".
+    pub point: String,
+    /// The object it is attached to.
+    pub handle: Handle,
+    pub snap: AssocSnap,
+}
+
+/// Where on the object an associative definition point sits.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AssocSnap {
+    /// Start point of a line/arc (or polyline vertex 0).
+    Start,
+    /// End point of a line/arc.
+    End,
+    Mid,
+    /// Centre of a circle/arc.
+    Center,
+    /// On a circle/arc at a fixed angle (radians) from its centre.
+    OnCircle {
+        angle: f64,
+    },
+    /// Intersection of this (line) object with another line.
+    Intersection {
+        other: Handle,
+    },
+    /// Vertex `index` of a polyline.
+    Vertex {
+        index: usize,
+    },
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -461,6 +504,12 @@ pub struct Table {
     pub style: String,
     #[serde(default = "default_text_h")]
     pub text_height: f64,
+    /// First row is a title (merged across, larger text).
+    #[serde(default)]
+    pub title: bool,
+    /// The row after the title holds column headers.
+    #[serde(default)]
+    pub header: bool,
 }
 fn default_text_h() -> f64 {
     0.18

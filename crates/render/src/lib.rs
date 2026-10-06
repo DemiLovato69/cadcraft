@@ -14,12 +14,13 @@ mod hatch;
 mod linetype;
 pub mod paper;
 pub mod raster;
+pub mod units;
 
 use cadcraft_color::{Color, Rgb};
 use cadcraft_doc::{Drawing, Entity, EntityKind, Handle, Lineweight, Prim, Space};
 use cadcraft_geom::{Bounds2, Mat3, Polyline, Vec2};
 
-pub use dim::dimension_geometry;
+pub use dim::{ArrowGeom, Arrowhead, DimGeometry, DimText, LineRole, arrowhead, dimension_geometry, dimension_geometry_with, format_linear_value};
 pub use fill::triangulate_evenodd;
 pub use paper::{PAPER_SIZES, PaperSize, Sheet, paper_size, sheet};
 
@@ -141,6 +142,26 @@ impl Builder<'_> {
             self.list.tris.push(q);
         }
         self.list.prims.push(DPrim { handle: ctx.top, color, lw: 0.0, kind: Kind::Tris, start, len: tris.len() as u32 });
+    }
+    /// Shaped text: strokes as polylines; TrueType glyphs filled (TEXTFILL) or outlined.
+    fn shaped(&mut self, ctx: &Ctx, color: Rgb, lw: f32, sh: &cadcraft_fonts::Shaped) {
+        for s in &sh.strokes {
+            self.polyline(ctx, color, lw, s);
+        }
+        if sh.glyphs.is_empty() {
+            return;
+        }
+        let fill = self.opts.fill && ctx.d.header.i64("TEXTFILL", 1) != 0;
+        for g in &sh.glyphs {
+            if fill {
+                let tris = fill::triangulate_evenodd(g);
+                self.tris(ctx, color, &tris);
+            } else {
+                for c in g {
+                    self.polyline(ctx, color, lw, c);
+                }
+            }
+        }
     }
     fn point(&mut self, ctx: &Ctx, color: Rgb, p: Vec2) {
         let q = ctx.xf.apply(p);
@@ -366,39 +387,18 @@ fn entity(b: &mut Builder, ctx: &Ctx, e: &Entity) {
             if !b.opts.text {
                 return;
             }
-            let (h, v) = align(t.halign, t.valign);
-            let oblique = t.oblique;
-            let (strokes, _) =
-                cadcraft_fonts::place_text(&t.value, t.insert.xy(), t.align_pt.map(|p| p.xy()), t.height, t.rotation, t.width_factor, oblique, h, v);
-            for s in strokes {
-                b.polyline(ctx, rgb, lw, &s);
-            }
+            let (sh, _) = place_text_entity(ctx.d, t, &t.value);
+            b.shaped(ctx, rgb, lw, &sh);
         }
         EntityKind::AttDef(a) => {
-            let (h, v) = align(a.text.halign, a.text.valign);
-            let (strokes, _) = cadcraft_fonts::place_text(
-                &a.tag,
-                a.text.insert.xy(),
-                a.text.align_pt.map(|p| p.xy()),
-                a.text.height,
-                a.text.rotation,
-                a.text.width_factor,
-                a.text.oblique,
-                h,
-                v,
-            );
-            for s in strokes {
-                b.polyline(ctx, rgb, lw, &s);
-            }
+            let (sh, _) = place_text_entity(ctx.d, &a.text, &a.tag);
+            b.shaped(ctx, rgb, lw, &sh);
         }
         EntityKind::MText(t) => {
             if !b.opts.text {
                 return;
             }
-            let l = cadcraft_fonts::layout_mtext(&t.contents, t.insert.xy(), t.height, t.width, t.attach, t.rotation, t.line_spacing);
-            for s in l.strokes {
-                b.polyline(ctx, rgb, lw, &s);
-            }
+            mtext(b, ctx, t, rgb, lw);
         }
         EntityKind::Insert(ins) => insert(b, ctx, e, ins, rgb),
         EntityKind::Dimension(dm) => {
@@ -410,19 +410,7 @@ fn entity(b: &mut Builder, ctx: &Ctx, e: &Entity) {
                     entity(b, &sub, be);
                 }
             } else {
-                let style = ctx.d.dim_style(&dm.style).cloned().unwrap_or_default();
-                let g = dim::dimension_geometry(dm, &style, ctx.d.header.f64("DIMSCALE", 1.0));
-                for l in &g.lines {
-                    b.polyline(ctx, rgb, lw, l);
-                }
-                for t in &g.fills {
-                    b.tris(ctx, rgb, t);
-                }
-                if b.opts.text {
-                    for s in &g.text {
-                        b.polyline(ctx, rgb, lw, s);
-                    }
-                }
+                dimension(b, ctx, e, dm, lw);
             }
         }
         EntityKind::Hatch(h) => {
@@ -494,54 +482,21 @@ fn entity(b: &mut Builder, ctx: &Ctx, e: &Entity) {
             b.polyline(ctx, rgb, lw, &[o, o + u + v]);
             b.polyline(ctx, rgb, lw, &[o + u, o + v]);
         }
-        EntityKind::Table(t) => {
-            let o = t.insert.xy();
-            let w: f64 = t.col_widths.iter().sum();
-            let mut y = 0.0;
-            b.polyline(ctx, rgb, lw, &[o, o + Vec2::new(w, 0.0)]);
-            for (r, rh) in t.row_heights.iter().enumerate() {
-                let mut x = 0.0;
-                for (c, cw) in t.col_widths.iter().enumerate() {
-                    if let Some(cell) = t.cells.get(r).and_then(|row| row.get(c))
-                        && !cell.text.is_empty()
-                        && b.opts.text
-                    {
-                        let center = o + Vec2::new(x + cw / 2.0, -(y + rh / 2.0));
-                        let (strokes, _) = cadcraft_fonts::place_text(
-                            &cell.text,
-                            center,
-                            Some(center),
-                            t.text_height,
-                            0.0,
-                            1.0,
-                            0.0,
-                            cadcraft_fonts::Align::Middle,
-                            cadcraft_fonts::VAlign::Middle,
-                        );
-                        for s in strokes {
-                            b.polyline(ctx, rgb, lw, &s);
-                        }
-                    }
-                    x += cw;
-                }
-                y += rh;
-                b.polyline(ctx, rgb, lw, &[o + Vec2::new(0.0, -y), o + Vec2::new(w, -y)]);
-            }
-            let mut x = 0.0;
-            b.polyline(ctx, rgb, lw, &[o, o + Vec2::new(0.0, -y)]);
-            for cw in &t.col_widths {
-                x += cw;
-                b.polyline(ctx, rgb, lw, &[o + Vec2::new(x, 0.0), o + Vec2::new(x, -y)]);
-            }
-        }
+        EntityKind::Table(t) => table(b, ctx, t, rgb, lw),
         EntityKind::Leader(l) => {
             let pts: Vec<Vec2> = l.vertices.iter().map(|v| v.xy()).collect();
             stroke(b, &pts);
             if l.arrow
                 && let (Some(a), Some(n)) = (pts.first(), pts.get(1))
             {
-                let size = ctx.d.dim_style(&l.style).map(|s| s.arrow_size).unwrap_or(0.18) * ctx.d.header.f64("DIMSCALE", 1.0);
-                b.tris(ctx, rgb, &dim::arrow(*a, (*a - *n).normalized(), size));
+                let st = ctx.d.dim_style(&l.style);
+                let size = st.map(|s| s.arrow_size).unwrap_or(0.18) * ctx.d.header.f64("DIMSCALE", 1.0);
+                let kind = dim::Arrowhead::parse(st.map(|s| s.arrow_block.as_str()).unwrap_or(""));
+                let g = dim::arrowhead(kind, *a, (*a - *n).normalized(), size);
+                for l in &g.lines {
+                    b.polyline(ctx, rgb, lw, l);
+                }
+                b.tris(ctx, rgb, &g.tris);
             }
         }
         EntityKind::MLeader(m) => {
@@ -556,10 +511,7 @@ fn entity(b: &mut Builder, ctx: &Ctx, e: &Entity) {
                 let land = m.landing.xy();
                 let dir = if t.insert.x >= land.x { 1.0 } else { -1.0 };
                 b.polyline(ctx, rgb, lw, &[land, land + Vec2::new(m.dogleg * dir, 0.0)]);
-                let l = cadcraft_fonts::layout_mtext(&t.contents, t.insert.xy(), t.height, t.width, t.attach, t.rotation, t.line_spacing);
-                for s in l.strokes {
-                    b.polyline(ctx, rgb, lw, &s);
-                }
+                mtext(b, ctx, t, rgb, lw);
             }
         }
         EntityKind::Point(p) => b.point(ctx, rgb, p.p.xy()),
@@ -590,6 +542,190 @@ fn entity(b: &mut Builder, ctx: &Ctx, e: &Entity) {
                     }
                 }
             }
+        }
+    }
+}
+
+/// The text style of an entity (Standard defaults when missing).
+fn text_style(d: &Drawing, name: &str) -> cadcraft_doc::TextStyle {
+    d.text_style(name).cloned().unwrap_or_default()
+}
+
+/// Shape a TEXT / ATTRIB / ATTDEF with its style's font and generation flags.
+pub fn place_text_entity(d: &Drawing, t: &cadcraft_doc::Text, value: &str) -> (cadcraft_fonts::Shaped, Bounds2) {
+    let ts = text_style(d, &t.style);
+    let font = cadcraft_fonts::TextFont::resolve(&ts.font);
+    let (h, v) = align(t.halign, t.valign);
+    let p = cadcraft_fonts::TextParams {
+        insert: t.insert.xy(),
+        align_pt: t.align_pt.map(|p| p.xy()),
+        height: t.height,
+        rotation: t.rotation,
+        width_factor: t.width_factor,
+        oblique: t.oblique,
+        h,
+        v,
+        backwards: ts.backwards,
+        upside_down: ts.upside_down,
+    };
+    cadcraft_fonts::place(&font, value, &p)
+}
+
+/// Lay out an MTEXT with its style's font.
+pub fn layout_mtext_entity(d: &Drawing, t: &cadcraft_doc::MText) -> cadcraft_fonts::MTextLayout {
+    let ts = text_style(d, &t.style);
+    let params = cadcraft_fonts::MTextParams {
+        insert: t.insert.xy(),
+        height: t.height,
+        width: t.width,
+        attach: t.attach,
+        rotation: t.rotation,
+        line_spacing: t.line_spacing,
+        font: cadcraft_fonts::TextFont::resolve(&ts.font),
+        width_factor: ts.width_factor,
+        oblique: ts.oblique,
+    };
+    cadcraft_fonts::layout_mtext_with(&t.contents, &params)
+}
+
+fn mtext_color(c: Option<cadcraft_fonts::MTextColor>, rgb: Rgb) -> Rgb {
+    match c {
+        Some(cadcraft_fonts::MTextColor::Aci(i)) => {
+            u8::try_from(i).ok().filter(|i| *i > 0).map(|i| Color::Index(i).resolve(Color::Index(7), Color::Index(7))).unwrap_or(rgb)
+        }
+        Some(cadcraft_fonts::MTextColor::Rgb(v)) => Rgb(((v >> 16) & 0xFF) as u8, ((v >> 8) & 0xFF) as u8, (v & 0xFF) as u8),
+        None => rgb,
+    }
+}
+
+fn mtext(b: &mut Builder, ctx: &Ctx, t: &cadcraft_doc::MText, rgb: Rgb, lw: f32) {
+    let l = layout_mtext_entity(ctx.d, t);
+    for p in &l.pieces {
+        b.shaped(ctx, mtext_color(p.color, rgb), lw, &p.shaped);
+    }
+}
+
+/// The font settings of a dimension style's text style.
+pub fn dim_text(d: &Drawing, st: &cadcraft_doc::DimStyle) -> DimText {
+    let ts = text_style(d, &st.text_style);
+    DimText { font: cadcraft_fonts::TextFont::resolve(&ts.font), fixed_height: ts.height, width_factor: ts.width_factor, oblique: ts.oblique }
+}
+
+/// Geometry of a dimension in a drawing: its style, overrides and text font.
+pub fn dimension_in(d: &Drawing, dm: &cadcraft_doc::Dimension) -> DimGeometry {
+    let style = d.dim_style(&dm.style).cloned().unwrap_or_default();
+    let st = style.with_overrides(&dm.overrides);
+    dim::dimension_geometry_with(dm, &style, d.header.f64("DIMSCALE", 1.0), &dim_text(d, &st))
+}
+
+fn dimension(b: &mut Builder, ctx: &Ctx, e: &Entity, dm: &cadcraft_doc::Dimension, lw: f32) {
+    let d = ctx.d;
+    let style = d.dim_style(&dm.style).cloned().unwrap_or_default().with_overrides(&dm.overrides);
+    let g = dimension_in(d, dm);
+    // DIMCLRD / DIMCLRE / DIMCLRT: ByBlock = the dimension's own colour.
+    let layer_name = if e.common.layer == "0" { ctx.block_layer.as_deref().unwrap_or("0") } else { e.common.layer.as_str() };
+    let layer_color = d.layer(layer_name).map(|l| l.color).unwrap_or(Color::Index(7));
+    let own = match e.common.color {
+        Color::ByLayer => layer_color,
+        Color::ByBlock => ctx.block_color,
+        c => c,
+    };
+    let dim_rgb = style.dim_line_color.resolve(layer_color, own);
+    let ext_rgb = style.ext_line_color.resolve(layer_color, own);
+    let txt_rgb = style.text_color.resolve(layer_color, own);
+    for (l, role) in g.lines.iter().zip(g.line_roles.iter().chain(std::iter::repeat(&LineRole::Dim))) {
+        b.polyline(ctx, if *role == LineRole::Ext { ext_rgb } else { dim_rgb }, lw, l);
+    }
+    for t in &g.fills {
+        b.tris(ctx, dim_rgb, t);
+    }
+    if b.opts.text {
+        let sh = cadcraft_fonts::Shaped { strokes: g.text.clone(), glyphs: g.text_glyphs.clone(), width: 0.0 };
+        b.shaped(ctx, txt_rgb, lw, &sh);
+    }
+}
+
+/// Covered cells of a table (inside another cell's merge, not its anchor).
+pub fn table_covered(t: &cadcraft_doc::Table) -> Vec<Vec<bool>> {
+    let rows = t.row_heights.len().min(10_000);
+    let cols = t.col_widths.len().min(10_000);
+    let mut cov = vec![vec![false; cols]; rows];
+    for (r, row) in t.cells.iter().enumerate().take(rows) {
+        for (c, cell) in row.iter().enumerate().take(cols) {
+            if let Some((rs, cs)) = cell.merged {
+                for rr in r..(r + rs.max(1) as usize).min(rows) {
+                    for cc in c..(c + cs.max(1) as usize).min(cols) {
+                        if (rr, cc) != (r, c)
+                            && let Some(x) = cov.get_mut(rr).and_then(|v| v.get_mut(cc))
+                        {
+                            *x = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    cov
+}
+
+fn table(b: &mut Builder, ctx: &Ctx, t: &cadcraft_doc::Table, rgb: Rgb, lw: f32) {
+    let o = t.insert.xy();
+    let rows = t.row_heights.len().min(10_000);
+    let cols = t.col_widths.len().min(10_000);
+    let xs: Vec<f64> = std::iter::once(0.0)
+        .chain(t.col_widths.iter().take(cols).scan(0.0, |a, w| {
+            *a += w;
+            Some(*a)
+        }))
+        .collect();
+    let ys: Vec<f64> = std::iter::once(0.0)
+        .chain(t.row_heights.iter().take(rows).scan(0.0, |a, h| {
+            *a += h;
+            Some(*a)
+        }))
+        .collect();
+    let cov = table_covered(t);
+    let style = ctx.d.table_styles.iter().find(|s| s.name.eq_ignore_ascii_case(&t.style)).cloned().unwrap_or_default();
+    let ts = text_style(ctx.d, "Standard");
+    let font = cadcraft_fonts::TextFont::resolve(&ts.font);
+    let x_at = |c: usize| xs.get(c).copied().unwrap_or(0.0);
+    let y_at = |r: usize| ys.get(r).copied().unwrap_or(0.0);
+    for r in 0..rows {
+        for c in 0..cols {
+            if cov.get(r).and_then(|v| v.get(c)).copied().unwrap_or(false) {
+                continue;
+            }
+            let cell = t.cells.get(r).and_then(|row| row.get(c));
+            let (rs, cs) = cell.and_then(|x| x.merged).map(|(a, b)| (a.max(1) as usize, b.max(1) as usize)).unwrap_or((1, 1));
+            let (r2, c2) = ((r + rs).min(rows), (c + cs).min(cols));
+            let (x0, x1, y0, y1) = (x_at(c), x_at(c2), y_at(r), y_at(r2));
+            let p = |x: f64, y: f64| o + Vec2::new(x, -y);
+            // Each cell draws its bottom and right edges; the outer top/left come from row 0 / col 0.
+            b.polyline(ctx, rgb, lw, &[p(x0, y1), p(x1, y1), p(x1, y0)]);
+            if r == 0 {
+                b.polyline(ctx, rgb, lw, &[p(x0, y0), p(x1, y0)]);
+            }
+            if c == 0 {
+                b.polyline(ctx, rgb, lw, &[p(x0, y0), p(x0, y1)]);
+            }
+            let Some(cell) = cell.filter(|x| !x.text.is_empty() && b.opts.text) else { continue };
+            let title = t.title && r == 0;
+            let header = t.header && r == usize::from(t.title);
+            let h = if title { t.text_height * 1.4 } else { t.text_height };
+            // Titles and headers are centred; data sits middle-left inside the cell margin.
+            let params = if title || header {
+                cadcraft_fonts::TextParams::centered(p((x0 + x1) / 2.0, (y0 + y1) / 2.0), h, 0.0)
+            } else {
+                let at = p(x0 + style.margin.max(0.0), (y0 + y1) / 2.0);
+                cadcraft_fonts::TextParams {
+                    align_pt: Some(at),
+                    h: cadcraft_fonts::Align::Left,
+                    v: cadcraft_fonts::VAlign::Middle,
+                    ..cadcraft_fonts::TextParams::new(at, h)
+                }
+            };
+            let (sh, _) = cadcraft_fonts::place(&font, &cell.text, &params);
+            b.shaped(ctx, rgb, lw, &sh);
         }
     }
 }
@@ -670,21 +806,8 @@ fn insert(b: &mut Builder, ctx: &Ctx, e: &Entity, ins: &cadcraft_doc::Insert, rg
             if a.invisible {
                 continue;
             }
-            let (h, v) = align(a.text.halign, a.text.valign);
-            let (strokes, _) = cadcraft_fonts::place_text(
-                &a.text.value,
-                a.text.insert.xy(),
-                a.text.align_pt.map(|p| p.xy()),
-                a.text.height,
-                a.text.rotation,
-                a.text.width_factor,
-                a.text.oblique,
-                h,
-                v,
-            );
-            for s in strokes {
-                b.polyline(ctx, rgb, 0.0, &s);
-            }
+            let (sh, _) = place_text_entity(ctx.d, &a.text, &a.text.value);
+            b.shaped(ctx, rgb, 0.0, &sh);
         }
     }
 }

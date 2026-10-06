@@ -14,3 +14,6 @@ cadcraft-color = { workspace = true }
 cadcraft-doc = { workspace = true }
 cadcraft-fonts = { workspace = true }
 tiny-skia = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

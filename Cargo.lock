@@ -567,6 +567,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cadcraft-constraints"
+version = "0.1.0"
+dependencies = [
+ "cadcraft-doc",
+ "cadcraft-geom",
+ "serde",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "cadcraft-doc"
 version = "0.1.0"
 dependencies = [
@@ -596,6 +606,7 @@ name = "cadcraft-engine"
 version = "0.1.0"
 dependencies = [
  "cadcraft-color",
+ "cadcraft-constraints",
  "cadcraft-doc",
  "cadcraft-fonts",
  "cadcraft-geom",
@@ -656,6 +667,7 @@ dependencies = [
  "cadcraft-doc",
  "cadcraft-fonts",
  "cadcraft-geom",
+ "serde_json",
  "tiny-skia",
 ]
 

@@ -29,6 +29,8 @@ fn dim(kind: DimKind, p13: Vec2, p14: Vec2, defpt: Vec2) -> EntityKind {
         text_rotation: 0.0,
         user_text_pos: false,
         block: None,
+        overrides: Default::default(),
+        assoc: Vec::new(),
     })
 }
 
@@ -175,6 +177,8 @@ pub fn bracket() -> Drawing {
             text_rotation: 0.0,
             user_text_pos: false,
             block: None,
+            overrides: Default::default(),
+            assoc: Vec::new(),
         }),
     );
     add(
@@ -193,6 +197,8 @@ pub fn bracket() -> Drawing {
             text_rotation: 0.0,
             user_text_pos: false,
             block: None,
+            overrides: Default::default(),
+            assoc: Vec::new(),
         }),
     );
 

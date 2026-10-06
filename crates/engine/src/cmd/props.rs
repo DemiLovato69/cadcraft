@@ -19,8 +19,33 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("ltscale", "Linetype Scale", run_ltscale).alias(&["lts"]).params("{scale}"),
         CommandSpec::new("units", "Units...", run_units).menu(&["Format", "Units..."]).alias(&["un"]).params("{lunits?: 1..5, luprec?: 0..8, aunits?: 0..4, auprec?: 0..8, insunits?}"),
         CommandSpec::new("limits", "Drawing Limits", run_limits).menu(&["Format", "Drawing Limits"]).params("{min: [x,y], max: [x,y]}"),
-        CommandSpec::new("style", "Text Style...", run_style).menu(&["Format", "Text Style..."]).alias(&["st"]).params("{name, font?, height?, widthFactor?, oblique?, current?}"),
-        CommandSpec::new("dimstyle", "Dimension Style...", run_dimstyle).menu(&["Format", "Dimension Style..."]).alias(&["d", "dst", "ddim"]).params("{name, current?, <style fields>}"),
+        CommandSpec::new("style", "Text Style...", run_style)
+            .menu(&["Format", "Text Style..."])
+            .alias(&["st"])
+            .params("{name, font?, bigFont?, height?, widthFactor?, oblique? (degrees), backwards?, upsideDown?, vertical?, annotative?, current?} → styles"),
+        CommandSpec::new("style.list", "List Text Styles", run_style_list).params("{} → text styles").noundo(),
+        CommandSpec::new("style.rename", "Rename Text Style", run_style_rename).params("{from, to}"),
+        CommandSpec::new("style.delete", "Delete Text Style", run_style_delete).params("{name} (not Standard, the current style or one in use)"),
+        CommandSpec::new("style.current", "Set Current Text Style", run_style_current).params("{name}"),
+        CommandSpec::new("dimstyle", "Dimension Style...", run_dimstyle)
+            .menu(&["Format", "Dimension Style..."])
+            .alias(&["d", "dst", "ddim"])
+            .params("{name, current?, <style fields or DIM* variables, e.g. arrowSize / DIMASZ, DIMTSZ, DIMBLK, DIMTAD, DIMLUNIT…>} → styles"),
+        CommandSpec::new("dimstyle.dimension", "Dimension Style...", run_dimstyle).menu(&["Dimension", "Dimension Style..."]).params("same as `dimstyle`"),
+        CommandSpec::new("dimstyle.list", "List Dimension Styles", run_dimstyle_list).params("{name?} → styles (with all variables for `name`)").noundo(),
+        CommandSpec::new("dimstyle.rename", "Rename Dimension Style", run_dimstyle_rename).params("{from, to}"),
+        CommandSpec::new("dimstyle.delete", "Delete Dimension Style", run_dimstyle_delete).params("{name} (not Standard, the current style or one in use)"),
+        CommandSpec::new("dimstyle.current", "Set Current Dimension Style", run_dimstyle_current).params("{name}"),
+        CommandSpec::new("dimstyle.override", "Dimension Style Override", dim_override)
+            .params("{handles?, <style fields or DIM* variables: values>, clear?: bool} (per-dimension overrides)"),
+        CommandSpec::new("tablestyle", "Table Style...", run_tablestyle)
+            .menu(&["Format", "Table Style..."])
+            .alias(&["ts"])
+            .params("{name, textHeight?, margin?, title?, header?, current?} → styles"),
+        CommandSpec::new("mleaderstyle", "Multileader Style...", run_mleaderstyle)
+            .menu(&["Format", "Multileader Style..."])
+            .alias(&["mls"])
+            .params("{name, arrowSize?, textHeight?, landingGap?, dogleg?, textStyle?, current?} → styles"),
         CommandSpec::new("ddptype", "Point Style...", run_ptype).menu(&["Format", "Point Style..."]).params("{pdmode, pdsize}"),
         CommandSpec::new("rename", "Rename...", run_rename).menu(&["Format", "Rename..."]).params("{table: layer|linetype|style|dimstyle|block, from, to}"),
     ]
@@ -358,8 +383,33 @@ fn run_limits(s: &mut Session, p: &Value) -> Result<Value> {
     ok()
 }
 
+fn style_json(st: &cadcraft_doc::TextStyle, current: &str) -> Value {
+    json!({
+        "name": st.name,
+        "font": st.font,
+        "bigFont": st.big_font,
+        "height": st.height,
+        "widthFactor": st.width_factor,
+        "oblique": st.oblique.to_degrees(),
+        "backwards": st.backwards,
+        "upsideDown": st.upside_down,
+        "vertical": st.vertical,
+        "annotative": st.annotative,
+        "current": st.name.eq_ignore_ascii_case(current),
+        "trueType": cadcraft_fonts::TextFont::resolve(&st.font).is_outline(),
+    })
+}
+
+fn styles_json(d: &cadcraft_doc::Drawing) -> Value {
+    let cur = d.header.str("TEXTSTYLE", "Standard");
+    json!({ "current": cur, "styles": d.text_styles.iter().map(|t| style_json(t, &cur)).collect::<Vec<_>>() })
+}
+
 fn run_style(s: &mut Session, p: &Value) -> Result<Value> {
-    let name = str_param(p, "name").ok_or_else(|| bad("style", "`name` is required"))?.to_string();
+    let name = str_param(p, "name").ok_or_else(|| bad("style", "`name` is required"))?.trim().to_string();
+    if name.is_empty() || name.len() > 255 {
+        return Err(bad("style", "bad style name"));
+    }
     let d = s.doc_mut()?;
     let idx = match d.text_styles.iter().position(|t| t.name.eq_ignore_ascii_case(&name)) {
         Some(i) => i,
@@ -368,28 +418,150 @@ fn run_style(s: &mut Session, p: &Value) -> Result<Value> {
             d.text_styles.len() - 1
         }
     };
+    let num = |k: &str| p.get(k).and_then(Value::as_f64).filter(|v| v.is_finite());
     if let Some(st) = d.text_styles.get_mut(idx) {
-        if let Some(f) = str_param(p, "font") {
+        if let Some(f) = str_param(p, "font").map(str::trim).filter(|f| !f.is_empty()) {
             st.font = f.to_string();
         }
-        if let Some(h) = p.get("height").and_then(Value::as_f64).filter(|h| *h >= 0.0) {
+        if let Some(f) = str_param(p, "bigFont") {
+            st.big_font = f.to_string();
+        }
+        if let Some(h) = num("height").filter(|h| *h >= 0.0) {
             st.height = h;
         }
-        if let Some(w) = p.get("widthFactor").and_then(Value::as_f64).filter(|w| *w > 0.0) {
+        if let Some(w) = num("widthFactor").filter(|w| *w > 0.0 && *w <= 100.0) {
             st.width_factor = w;
         }
-        if let Some(o) = p.get("oblique").and_then(Value::as_f64) {
+        if let Some(o) = num("oblique").filter(|o| o.abs() <= 85.0) {
             st.oblique = o.to_radians();
+        }
+        for (k, slot) in [
+            ("backwards", &mut st.backwards),
+            ("upsideDown", &mut st.upside_down),
+            ("vertical", &mut st.vertical),
+            ("annotative", &mut st.annotative),
+        ] {
+            if let Some(b) = p.get(k).and_then(Value::as_bool) {
+                *slot = b;
+            }
         }
     }
     if bool_or(p, "current", true) {
         d.header.set_str("TEXTSTYLE", &name);
     }
+    Ok(styles_json(d))
+}
+
+fn run_style_list(s: &mut Session, _p: &Value) -> Result<Value> {
+    Ok(styles_json(s.doc()?))
+}
+
+fn run_style_current(s: &mut Session, p: &Value) -> Result<Value> {
+    let name = str_param(p, "name").ok_or_else(|| bad("style.current", "`name` is required"))?;
+    let d = s.doc_mut()?;
+    let n = d.text_style(name).map(|t| t.name.clone()).ok_or_else(|| bad("style.current", format!("no text style `{name}`")))?;
+    d.header.set_str("TEXTSTYLE", &n);
     ok()
 }
 
+/// Text style names used by entities (in model, paper spaces and blocks) and dimension styles.
+fn text_styles_in_use(d: &cadcraft_doc::Drawing) -> Vec<String> {
+    let mut out: Vec<String> = d.dim_styles.iter().map(|s| s.text_style.clone()).collect();
+    out.extend(d.mleader_styles.iter().map(|s| s.text_style.clone()));
+    let stores = std::iter::once(&d.model).chain(d.layouts.iter().map(|l| &l.entities)).chain(d.blocks.values().map(|b| &b.entities));
+    for st in stores {
+        for e in st.iter() {
+            match &e.kind {
+                EntityKind::Text(t) => out.push(t.style.clone()),
+                EntityKind::MText(t) => out.push(t.style.clone()),
+                EntityKind::AttDef(a) => out.push(a.text.style.clone()),
+                EntityKind::Insert(i) => out.extend(i.attribs.iter().map(|a| a.text.style.clone())),
+                EntityKind::MLeader(m) => out.extend(m.text.iter().map(|t| t.style.clone())),
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+fn run_style_rename(s: &mut Session, p: &Value) -> Result<Value> {
+    let from = str_param(p, "from").ok_or_else(|| bad("style.rename", "`from` is required"))?.to_string();
+    let to = str_param(p, "to").map(str::trim).filter(|t| !t.is_empty()).ok_or_else(|| bad("style.rename", "`to` is required"))?.to_string();
+    let d = s.doc_mut()?;
+    if from.eq_ignore_ascii_case("Standard") {
+        return Err(bad("style.rename", "the Standard style cannot be renamed"));
+    }
+    if d.text_style(&to).is_some() && !to.eq_ignore_ascii_case(&from) {
+        return Err(bad("style.rename", format!("a text style `{to}` already exists")));
+    }
+    let st = d.text_styles.iter_mut().find(|t| t.name.eq_ignore_ascii_case(&from)).ok_or_else(|| bad("style.rename", "no such style"))?;
+    st.name = to.clone();
+    // References follow the new name.
+    let fix = |n: &mut String| {
+        if n.eq_ignore_ascii_case(&from) {
+            *n = to.clone();
+        }
+    };
+    if d.header.str("TEXTSTYLE", "Standard").eq_ignore_ascii_case(&from) {
+        d.header.set_str("TEXTSTYLE", &to);
+    }
+    d.dim_styles.iter_mut().for_each(|x| fix(&mut x.text_style));
+    d.mleader_styles.iter_mut().for_each(|x| fix(&mut x.text_style));
+    for space in
+        std::iter::once(cadcraft_doc::Space::Model).chain(d.layouts.iter().map(|l| cadcraft_doc::Space::Paper(l.name.clone())).collect::<Vec<_>>())
+    {
+        let hs: Vec<cadcraft_doc::Handle> = d.space(&space).map(|st| st.handles()).unwrap_or_default();
+        for h in hs {
+            let uses = d.entity(h).is_some_and(|e| match &e.kind {
+                EntityKind::Text(t) => t.style.eq_ignore_ascii_case(&from),
+                EntityKind::MText(t) => t.style.eq_ignore_ascii_case(&from),
+                EntityKind::AttDef(a) => a.text.style.eq_ignore_ascii_case(&from),
+                EntityKind::Insert(i) => i.attribs.iter().any(|a| a.text.style.eq_ignore_ascii_case(&from)),
+                _ => false,
+            });
+            if uses {
+                d.modify_entity(h, |e| match &mut e.kind {
+                    EntityKind::Text(t) => fix(&mut t.style),
+                    EntityKind::MText(t) => fix(&mut t.style),
+                    EntityKind::AttDef(a) => fix(&mut a.text.style),
+                    EntityKind::Insert(i) => i.attribs.iter_mut().for_each(|a| fix(&mut a.text.style)),
+                    _ => {}
+                })?;
+            }
+        }
+    }
+    Ok(styles_json(d))
+}
+
+fn run_style_delete(s: &mut Session, p: &Value) -> Result<Value> {
+    let name = str_param(p, "name").ok_or_else(|| bad("style.delete", "`name` is required"))?.to_string();
+    let d = s.doc_mut()?;
+    if name.eq_ignore_ascii_case("Standard") {
+        return Err(bad("style.delete", "the Standard style cannot be deleted"));
+    }
+    if d.header.str("TEXTSTYLE", "Standard").eq_ignore_ascii_case(&name) {
+        return Err(bad("style.delete", "the current text style cannot be deleted"));
+    }
+    if text_styles_in_use(d).iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+        return Err(bad("style.delete", format!("text style `{name}` is in use")));
+    }
+    let before = d.text_styles.len();
+    d.text_styles.retain(|t| !t.name.eq_ignore_ascii_case(&name));
+    if d.text_styles.len() == before {
+        return Err(bad("style.delete", format!("no text style `{name}`")));
+    }
+    Ok(styles_json(d))
+}
+
+fn dimstyles_json(d: &cadcraft_doc::Drawing) -> Value {
+    json!({ "current": d.header.str("DIMSTYLE", "Standard"), "styles": d.dim_styles.iter().map(|s| s.name.clone()).collect::<Vec<_>>() })
+}
+
 fn run_dimstyle(s: &mut Session, p: &Value) -> Result<Value> {
-    let name = str_param(p, "name").ok_or_else(|| bad("dimstyle", "`name` is required"))?.to_string();
+    let name = str_param(p, "name").ok_or_else(|| bad("dimstyle", "`name` is required"))?.trim().to_string();
+    if name.is_empty() || name.len() > 255 {
+        return Err(bad("dimstyle", "bad style name"));
+    }
     let d = s.doc_mut()?;
     let base = d.dim_style(&d.header.str("DIMSTYLE", "Standard")).cloned().unwrap_or_default();
     let idx = match d.dim_styles.iter().position(|t| t.name.eq_ignore_ascii_case(&name)) {
@@ -399,24 +571,215 @@ fn run_dimstyle(s: &mut Session, p: &Value) -> Result<Value> {
             d.dim_styles.len() - 1
         }
     };
-    if let Some(st) = d.dim_styles.get_mut(idx) {
-        // Merge any provided fields through serde.
-        let mut cur = serde_json::to_value(&*st).unwrap_or(Value::Null);
-        if let (Some(o), Some(src)) = (cur.as_object_mut(), p.as_object()) {
-            for (k, v) in src {
-                if k != "name" && k != "current" && o.contains_key(k) {
-                    o.insert(k.clone(), v.clone());
-                }
-            }
-        }
-        if let Ok(ns) = serde_json::from_value::<cadcraft_doc::DimStyle>(cur) {
-            *st = ns;
-        }
+    let mut rejected = Vec::new();
+    if let (Some(st), Some(src)) = (d.dim_styles.get_mut(idx), p.as_object()) {
+        let fields: serde_json::Map<String, Value> =
+            src.iter().filter(|(k, _)| !matches!(k.as_str(), "name" | "current")).map(|(k, v)| (k.clone(), v.clone())).collect();
+        rejected = st.apply_fields(&fields);
     }
     if bool_or(p, "current", true) {
         d.header.set_str("DIMSTYLE", &name);
     }
-    Ok(json!({ "styles": d.dim_styles.iter().map(|s| s.name.clone()).collect::<Vec<_>>() }))
+    let mut out = dimstyles_json(d);
+    if !rejected.is_empty()
+        && let Some(o) = out.as_object_mut()
+    {
+        o.insert("ignored".into(), json!(rejected));
+    }
+    Ok(out)
+}
+
+fn run_dimstyle_list(s: &mut Session, p: &Value) -> Result<Value> {
+    let d = s.doc()?;
+    let mut out = dimstyles_json(d);
+    if let Some(n) = str_param(p, "name") {
+        let st = d.dim_style(n).ok_or_else(|| bad("dimstyle.list", format!("no dimension style `{n}`")))?;
+        let vars: serde_json::Map<String, Value> = {
+            let v = serde_json::to_value(st).unwrap_or(Value::Null);
+            cadcraft_doc::DIMVARS.iter().filter_map(|(var, field)| v.get(*field).map(|x| ((*var).to_string(), x.clone()))).collect()
+        };
+        if let Some(o) = out.as_object_mut() {
+            o.insert("style".into(), serde_json::to_value(st).unwrap_or(Value::Null));
+            o.insert("variables".into(), Value::Object(vars));
+        }
+    }
+    Ok(out)
+}
+
+fn run_dimstyle_current(s: &mut Session, p: &Value) -> Result<Value> {
+    let name = str_param(p, "name").ok_or_else(|| bad("dimstyle.current", "`name` is required"))?;
+    let d = s.doc_mut()?;
+    let n = d.dim_style(name).map(|t| t.name.clone()).ok_or_else(|| bad("dimstyle.current", format!("no dimension style `{name}`")))?;
+    d.header.set_str("DIMSTYLE", &n);
+    Ok(dimstyles_json(d))
+}
+
+fn dims_using(d: &cadcraft_doc::Drawing, name: &str) -> Vec<(cadcraft_doc::Space, cadcraft_doc::Handle)> {
+    let mut out = Vec::new();
+    for space in std::iter::once(cadcraft_doc::Space::Model).chain(d.layouts.iter().map(|l| cadcraft_doc::Space::Paper(l.name.clone()))) {
+        if let Some(st) = d.space(&space) {
+            for e in st.iter() {
+                let uses = match &e.kind {
+                    EntityKind::Dimension(dm) => dm.style.eq_ignore_ascii_case(name),
+                    EntityKind::Leader(l) => l.style.eq_ignore_ascii_case(name),
+                    _ => false,
+                };
+                if uses {
+                    out.push((space.clone(), e.handle));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn run_dimstyle_rename(s: &mut Session, p: &Value) -> Result<Value> {
+    let from = str_param(p, "from").ok_or_else(|| bad("dimstyle.rename", "`from` is required"))?.to_string();
+    let to = str_param(p, "to").map(str::trim).filter(|t| !t.is_empty()).ok_or_else(|| bad("dimstyle.rename", "`to` is required"))?.to_string();
+    let d = s.doc_mut()?;
+    if from.eq_ignore_ascii_case("Standard") {
+        return Err(bad("dimstyle.rename", "the Standard style cannot be renamed"));
+    }
+    if d.dim_style(&to).is_some() && !to.eq_ignore_ascii_case(&from) {
+        return Err(bad("dimstyle.rename", format!("a dimension style `{to}` already exists")));
+    }
+    let st = d.dim_styles.iter_mut().find(|t| t.name.eq_ignore_ascii_case(&from)).ok_or_else(|| bad("dimstyle.rename", "no such dimension style"))?;
+    st.name = to.clone();
+    if d.header.str("DIMSTYLE", "Standard").eq_ignore_ascii_case(&from) {
+        d.header.set_str("DIMSTYLE", &to);
+    }
+    for (_, h) in dims_using(d, &from) {
+        d.modify_entity(h, |e| match &mut e.kind {
+            EntityKind::Dimension(dm) => dm.style = to.clone(),
+            EntityKind::Leader(l) => l.style = to.clone(),
+            _ => {}
+        })?;
+    }
+    Ok(dimstyles_json(d))
+}
+
+fn run_dimstyle_delete(s: &mut Session, p: &Value) -> Result<Value> {
+    let name = str_param(p, "name").ok_or_else(|| bad("dimstyle.delete", "`name` is required"))?.to_string();
+    let d = s.doc_mut()?;
+    if name.eq_ignore_ascii_case("Standard") {
+        return Err(bad("dimstyle.delete", "the Standard style cannot be deleted"));
+    }
+    if d.header.str("DIMSTYLE", "Standard").eq_ignore_ascii_case(&name) {
+        return Err(bad("dimstyle.delete", "the current dimension style cannot be deleted"));
+    }
+    if !dims_using(d, &name).is_empty() {
+        return Err(bad("dimstyle.delete", format!("dimension style `{name}` is in use")));
+    }
+    let before = d.dim_styles.len();
+    d.dim_styles.retain(|t| !t.name.eq_ignore_ascii_case(&name));
+    if d.dim_styles.len() == before {
+        return Err(bad("dimstyle.delete", format!("no dimension style `{name}`")));
+    }
+    Ok(dimstyles_json(d))
+}
+
+/// Per-dimension style overrides (DIMOVERRIDE): merge fields, or `clear` them.
+pub(super) fn dim_override(s: &mut Session, p: &Value) -> Result<Value> {
+    let hs = targets(s, p)?;
+    let clear = bool_or(p, "clear", false);
+    let fields: serde_json::Map<String, Value> = p
+        .as_object()
+        .map(|o| o.iter().filter(|(k, _)| !matches!(k.as_str(), "handles" | "handle" | "clear")).map(|(k, v)| (k.clone(), v.clone())).collect())
+        .unwrap_or_default();
+    // Validate against a scratch style; store canonical field names.
+    let mut scratch = cadcraft_doc::DimStyle::default();
+    let rejected = scratch.apply_fields(&fields);
+    let good: serde_json::Map<String, Value> = fields
+        .iter()
+        .filter(|(k, _)| !rejected.contains(k))
+        .filter_map(|(k, v)| cadcraft_doc::DimStyle::field_name(k).map(|f| (f.to_string(), v.clone())))
+        .collect();
+    if !clear && good.is_empty() {
+        return Err(bad("dimoverride", format!("no valid dimension variables given (ignored: {})", rejected.join(", "))));
+    }
+    let d = s.doc_mut()?;
+    let mut n = 0;
+    for h in &hs {
+        d.modify_entity(*h, |e| {
+            if let EntityKind::Dimension(dm) = &mut e.kind {
+                if clear {
+                    dm.overrides.clear();
+                }
+                for (k, v) in &good {
+                    dm.overrides.insert(k.clone(), v.clone());
+                }
+                dm.block = None;
+                n += 1;
+            }
+        })?;
+    }
+    Ok(json!({ "changed": n, "ignored": rejected }))
+}
+
+fn run_tablestyle(s: &mut Session, p: &Value) -> Result<Value> {
+    let d = s.doc_mut()?;
+    if let Some(name) = str_param(p, "name").map(str::trim).filter(|n| !n.is_empty()) {
+        let idx = match d.table_styles.iter().position(|t| t.name.eq_ignore_ascii_case(name)) {
+            Some(i) => i,
+            None => {
+                d.table_styles.push(cadcraft_doc::TableStyle { name: name.to_string(), ..Default::default() });
+                d.table_styles.len() - 1
+            }
+        };
+        if let Some(st) = d.table_styles.get_mut(idx) {
+            if let Some(h) = p.get("textHeight").and_then(Value::as_f64).filter(|h| h.is_finite() && *h > 0.0) {
+                st.text_height = h;
+            }
+            if let Some(m) = p.get("margin").and_then(Value::as_f64).filter(|h| h.is_finite() && *h >= 0.0) {
+                st.margin = m;
+            }
+            if let Some(b) = p.get("title").and_then(Value::as_bool) {
+                st.title = b;
+            }
+            if let Some(b) = p.get("header").and_then(Value::as_bool) {
+                st.header = b;
+            }
+        }
+        if bool_or(p, "current", true) {
+            d.header.set_str("CTABLESTYLE", name);
+        }
+    }
+    Ok(json!({ "current": d.header.str("CTABLESTYLE", "Standard"), "styles": serde_json::to_value(&d.table_styles).unwrap_or(Value::Null) }))
+}
+
+fn run_mleaderstyle(s: &mut Session, p: &Value) -> Result<Value> {
+    let d = s.doc_mut()?;
+    if let Some(name) = str_param(p, "name").map(str::trim).filter(|n| !n.is_empty()) {
+        let idx = match d.mleader_styles.iter().position(|t| t.name.eq_ignore_ascii_case(name)) {
+            Some(i) => i,
+            None => {
+                d.mleader_styles.push(cadcraft_doc::MLeaderStyle { name: name.to_string(), ..Default::default() });
+                d.mleader_styles.len() - 1
+            }
+        };
+        if let Some(st) = d.mleader_styles.get_mut(idx) {
+            let num = |k: &str| p.get(k).and_then(Value::as_f64).filter(|h| h.is_finite() && *h >= 0.0);
+            if let Some(v) = num("arrowSize") {
+                st.arrow_size = v;
+            }
+            if let Some(v) = num("textHeight").filter(|v| *v > 0.0) {
+                st.text_height = v;
+            }
+            if let Some(v) = num("landingGap") {
+                st.landing_gap = v;
+            }
+            if let Some(v) = num("dogleg") {
+                st.dogleg = v;
+            }
+            if let Some(t) = str_param(p, "textStyle") {
+                st.text_style = t.to_string();
+            }
+        }
+        if bool_or(p, "current", true) {
+            d.header.set_str("CMLEADERSTYLE", name);
+        }
+    }
+    Ok(json!({ "current": d.header.str("CMLEADERSTYLE", "Standard"), "styles": serde_json::to_value(&d.mleader_styles).unwrap_or(Value::Null) }))
 }
 
 fn run_ptype(s: &mut Session, p: &Value) -> Result<Value> {
@@ -439,14 +802,10 @@ fn run_rename(s: &mut Session, p: &Value) -> Result<Value> {
             s.execute("layer.set", &json!({ "name": from, "newName": to }))?;
         }
         "style" => {
-            let d = s.doc_mut()?;
-            let st = d.text_styles.iter_mut().find(|t| t.name.eq_ignore_ascii_case(&from)).ok_or_else(|| bad("rename", "no such style"))?;
-            st.name = to;
+            run_style_rename(s, &json!({ "from": from, "to": to }))?;
         }
         "dimstyle" => {
-            let d = s.doc_mut()?;
-            let st = d.dim_styles.iter_mut().find(|t| t.name.eq_ignore_ascii_case(&from)).ok_or_else(|| bad("rename", "no such dimension style"))?;
-            st.name = to;
+            run_dimstyle_rename(s, &json!({ "from": from, "to": to }))?;
         }
         "linetype" => {
             let d = s.doc_mut()?;

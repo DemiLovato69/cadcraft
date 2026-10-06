@@ -9,7 +9,7 @@ use skrifa::instance::{LocationRef, Size};
 use skrifa::outline::{DrawSettings, OutlinePen};
 use skrifa::{FontRef, MetadataProvider};
 
-use crate::Run;
+use crate::{Run, Shaped};
 
 /// Font bytes by lower-case family/file stem.
 type Db = HashMap<String, Arc<Vec<u8>>>;
@@ -116,23 +116,38 @@ pub fn find(name: &str) -> Option<Arc<Vec<u8>>> {
     None
 }
 
+/// A glyph outline in font units (at 1000 units per em), flattened, plus its advance.
+struct GlyphOutline {
+    contours: Vec<Vec<Vec2>>,
+    advance: f64,
+}
+
+/// Cached glyph outlines keyed by (font bytes address, length, char). Fonts live for the whole
+/// process in the font table, so the address identifies them.
+type GlyphCache = HashMap<(usize, usize, char), Arc<GlyphOutline>>;
+
+fn glyph_cache() -> &'static Mutex<GlyphCache> {
+    static C: OnceLock<Mutex<GlyphCache>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+const MAX_CACHED_GLYPHS: usize = 40_000;
+const UPEM: f32 = 1000.0;
+
 struct Pen {
     contours: Vec<Vec<Vec2>>,
     cur: Vec<Vec2>,
-    scale: f64,
-    dx: f64,
-    wf: f64,
-    shear: f64,
 }
 
 impl Pen {
-    fn pt(&self, x: f32, y: f32) -> Vec2 {
-        let y = f64::from(y) * self.scale;
-        Vec2::new(self.dx + f64::from(x) * self.scale * self.wf + y * self.shear, y)
+    fn pt(x: f32, y: f32) -> Vec2 {
+        Vec2::new(f64::from(x), f64::from(y))
     }
     fn flush(&mut self) {
-        if self.cur.len() > 1 {
-            if let Some(f) = self.cur.first().copied() {
+        if self.cur.len() > 2 {
+            if let (Some(f), Some(l)) = (self.cur.first().copied(), self.cur.last().copied())
+                && f != l
+            {
                 self.cur.push(f);
             }
             self.contours.push(std::mem::take(&mut self.cur));
@@ -145,17 +160,15 @@ impl Pen {
 impl OutlinePen for Pen {
     fn move_to(&mut self, x: f32, y: f32) {
         self.flush();
-        let p = self.pt(x, y);
-        self.cur.push(p);
+        self.cur.push(Self::pt(x, y));
     }
     fn line_to(&mut self, x: f32, y: f32) {
-        let p = self.pt(x, y);
-        self.cur.push(p);
+        self.cur.push(Self::pt(x, y));
     }
     fn quad_to(&mut self, cx0: f32, cy0: f32, x: f32, y: f32) {
         let a = self.cur.last().copied().unwrap_or_default();
-        let c = self.pt(cx0, cy0);
-        let b = self.pt(x, y);
+        let c = Self::pt(cx0, cy0);
+        let b = Self::pt(x, y);
         for i in 1..=6 {
             let t = f64::from(i) / 6.0;
             let u = 1.0 - t;
@@ -164,9 +177,9 @@ impl OutlinePen for Pen {
     }
     fn curve_to(&mut self, cx0: f32, cy0: f32, cx1: f32, cy1: f32, x: f32, y: f32) {
         let a = self.cur.last().copied().unwrap_or_default();
-        let c0 = self.pt(cx0, cy0);
-        let c1 = self.pt(cx1, cy1);
-        let b = self.pt(x, y);
+        let c0 = Self::pt(cx0, cy0);
+        let c1 = Self::pt(cx1, cy1);
+        let b = Self::pt(x, y);
         for i in 1..=8 {
             let t = f64::from(i) / 8.0;
             let u = 1.0 - t;
@@ -178,25 +191,84 @@ impl OutlinePen for Pen {
     }
 }
 
+/// Cap height of a font in font units at 1000 units per em.
+fn cap_height(f: &FontRef) -> f64 {
+    let metrics = f.metrics(Size::new(UPEM), LocationRef::default());
+    f64::from(metrics.cap_height.filter(|c| *c > 0.0).unwrap_or(metrics.ascent * 0.72).max(1.0))
+}
+
+fn glyph(font: &[u8], f: &FontRef, c: char) -> Arc<GlyphOutline> {
+    let key = (font.as_ptr() as usize, font.len(), c);
+    if let Some(g) = glyph_cache().lock().unwrap_or_else(PoisonError::into_inner).get(&key) {
+        return g.clone();
+    }
+    let gid = f.charmap().map(c).unwrap_or_default();
+    let mut pen = Pen { contours: Vec::new(), cur: Vec::new() };
+    if let Some(g) = f.outline_glyphs().get(gid) {
+        let _ = g.draw(DrawSettings::unhinted(Size::new(UPEM), LocationRef::default()), &mut pen);
+        pen.flush();
+    }
+    let advance = f64::from(f.glyph_metrics(Size::new(UPEM), LocationRef::default()).advance_width(gid).unwrap_or(UPEM * 0.5));
+    let g = Arc::new(GlyphOutline { contours: pen.contours, advance });
+    let mut cache = glyph_cache().lock().unwrap_or_else(PoisonError::into_inner);
+    if cache.len() > MAX_CACHED_GLYPHS {
+        cache.clear();
+    }
+    cache.insert(key, g.clone());
+    g
+}
+
+/// Shape one line with a TrueType font: closed glyph contours grouped per glyph (baseline at
+/// y = 0, x from 0) plus `%%u`/`%%o` decorations as strokes. Text height = cap height.
+pub fn shape(font: &[u8], s: &str, height: f64, width_factor: f64, oblique: f64) -> Option<Shaped> {
+    let f = FontRef::new(font).ok()?;
+    let h = if height.is_finite() && height > 0.0 { height } else { 1.0 };
+    let scale = h / cap_height(&f);
+    let wf = if width_factor.is_finite() && width_factor.abs() > 1e-6 { width_factor } else { 1.0 };
+    let shear = oblique.tan().clamp(-10.0, 10.0);
+    let mut out = Shaped::default();
+    let mut spans = Vec::new();
+    let mut x = 0.0;
+    for (c, under, over) in crate::decode_controls(s) {
+        let g = glyph(font, &f, c);
+        if !c.is_whitespace() {
+            let contours: Vec<Vec<Vec2>> = g
+                .contours
+                .iter()
+                .map(|ct| {
+                    ct.iter()
+                        .map(|p| {
+                            let y = p.y * scale;
+                            Vec2::new(x + p.x * scale * wf + y * shear, y)
+                        })
+                        .collect()
+                })
+                .collect();
+            if !contours.is_empty() {
+                out.glyphs.push(contours);
+            }
+        }
+        let adv = g.advance * scale * wf;
+        spans.push((x, x + adv, under, over));
+        x += adv;
+    }
+    out.strokes.extend(crate::decorations(&spans, h));
+    out.width = x;
+    Some(out)
+}
+
+/// Width of one line set in a TrueType font.
+pub fn width(font: &[u8], s: &str, height: f64, width_factor: f64) -> Option<f64> {
+    let f = FontRef::new(font).ok()?;
+    let scale = height / cap_height(&f);
+    let wf = if width_factor.is_finite() && width_factor.abs() > 1e-6 { width_factor } else { 1.0 };
+    Some(crate::decode_controls(s).iter().map(|(c, _, _)| glyph(font, &f, *c).advance * scale * wf).sum())
+}
+
 /// Lay out one line with a TrueType font: closed glyph contours (baseline at y = 0).
 pub fn layout_line(font: &[u8], s: &str, height: f64, width_factor: f64, oblique: f64) -> Option<Run> {
-    let f = FontRef::new(font).ok()?;
-    let upem = 1000.0f32;
-    let metrics = f.metrics(Size::new(upem), LocationRef::default());
-    let cap = metrics.cap_height.filter(|c| *c > 0.0).unwrap_or(metrics.ascent * 0.72).max(1.0);
-    let scale = height / f64::from(cap);
-    let wf = if width_factor.is_finite() && width_factor.abs() > 1e-6 { width_factor } else { 1.0 };
-    let gm = f.glyph_metrics(Size::new(upem), LocationRef::default());
-    let charmap = f.charmap();
-    let outlines = f.outline_glyphs();
-    let mut pen = Pen { contours: Vec::new(), cur: Vec::new(), scale, dx: 0.0, wf, shear: oblique.tan().clamp(-10.0, 10.0) };
-    for (c, _, _) in crate::decode_controls(s) {
-        let gid = charmap.map(c).unwrap_or_default();
-        if let Some(g) = outlines.get(gid) {
-            let _ = g.draw(DrawSettings::unhinted(Size::new(upem), LocationRef::default()), &mut pen);
-            pen.flush();
-        }
-        pen.dx += f64::from(gm.advance_width(gid).unwrap_or(upem * 0.5)) * scale * wf;
-    }
-    Some(Run { strokes: pen.contours, width: pen.dx })
+    let sh = shape(font, s, height, width_factor, oblique)?;
+    let mut strokes: Vec<Vec<Vec2>> = sh.glyphs.into_iter().flatten().collect();
+    strokes.extend(sh.strokes);
+    Some(Run { strokes, width: sh.width })
 }

@@ -8,6 +8,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
+pub mod assoc;
 pub mod cmd;
 pub mod grips;
 pub mod prompt;
@@ -456,6 +457,8 @@ impl Session {
                 return Err(EngineError::Internal(id.into(), msg));
             }
         };
+        cmd::constraints::after_command(self, before.as_ref().map(|b| &b.0), spec.undoable && result.is_ok());
+        assoc::after_command(self, before.as_ref().map(|b| &b.0), before.as_ref().map(|b| b.2));
         if spec.undoable
             && let Some((doc, sel, uid)) = before
             && let Some(st) = self.docs.iter_mut().find(|d| d.uid == uid)
@@ -644,6 +647,8 @@ impl Session {
         self.pending_window = None;
         let label = find_command(&run.id).map(|c| c.label).unwrap_or("Command");
         let _ = cancelled;
+        cmd::constraints::after_command(self, Some(&run.before), true);
+        assoc::after_command(self, Some(&run.before), None);
         if let Ok(st) = self.state_mut()
             && !Arc::ptr_eq(&run.before, &st.doc)
         {

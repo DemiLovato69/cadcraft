@@ -1,7 +1,8 @@
 //! Dimensions and leaders: DIMLINEAR, DIMALIGNED, DIMRADIUS, DIMDIAMETER, DIMANGULAR, DIMARC,
-//! DIMORDINATE, DIMCONTINUE, DIMBASELINE, QDIM, DIM (smart), MLEADER, LEADER, TOLERANCE.
+//! DIMORDINATE, DIMCONTINUE, DIMBASELINE, QDIM, DIM (smart), MLEADER, LEADER, DIMOVERRIDE,
+//! DIMREASSOCIATE / DIMDISASSOCIATE, DIMTEDIT, DIMSPACE.
 
-use cadcraft_doc::{DimKind, Dimension, EntityKind, Handle, MLeader, MText, Prim};
+use cadcraft_doc::{AssocSnap, DimAssoc, DimKind, Dimension, EntityKind, Handle, MLeader, MText, Prim};
 use cadcraft_geom::{Segment, Vec2, Vec3};
 use serde_json::{Value, json};
 
@@ -14,7 +15,7 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("dimlinear", "Linear", run_linear)
             .menu(&["Dimension", "Linear"])
             .alias(&["dli", "dimlin"])
-            .params("{p1, p2, at, rotation? (degrees; default: horizontal/vertical from `at`), text?}")
+            .params("{p1, p2, at, rotation? (degrees; default: horizontal/vertical from `at`), text?} | {object: hex, at} (associative)")
             .interactive(|_| Ok(Box::new(LinearM::new(false)))),
         CommandSpec::new("dimaligned", "Aligned", run_aligned)
             .menu(&["Dimension", "Aligned"])
@@ -34,7 +35,7 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("dimangular", "Angular", run_angular)
             .menu(&["Dimension", "Angular"])
             .alias(&["dan", "dimang"])
-            .params("{vertex, p1, p2, at}")
+            .params("{vertex, p1, p2, at} | {lines: [hex, hex], at} | {arc: hex, at} (associative)")
             .interactive(|_| Ok(Box::new(AngularM::default()))),
         CommandSpec::new("dimarc", "Arc Length", run_arclen)
             .menu(&["Dimension", "Arc Length"])
@@ -70,7 +71,34 @@ pub fn specs() -> Vec<CommandSpec> {
             .interactive(|_| Ok(Box::new(MLeaderM::default()))),
         CommandSpec::new("leader", "Leader", run_leader).alias(&["lead"]).params("{points: [[x,y]...], text?}"),
         CommandSpec::new("dimstyle.update", "Update", run_update).menu(&["Dimension", "Update"]).params("{handles?}"),
-        CommandSpec::new("dimoverride", "Override", run_override).menu(&["Dimension", "Override"]).params("{handles?, text}"),
+        CommandSpec::new("dimoverride", "Override", run_override)
+            .menu(&["Dimension", "Override"])
+            .alias(&["dov", "dimover"])
+            .params("{handles?, <DimStyle fields or DIM* variables: values>, clear?: bool, text?: override text}")
+            .interactive(|s| Ok(Box::new(OverrideM::new(s)))),
+        CommandSpec::new("dimreassociate", "Reassociate Dimensions", run_reassociate)
+            .menu(&["Dimension", "Reassociate Dimensions"])
+            .alias(&["dre"])
+            .params("{handles?} (dimensions; attaches their definition points to the objects under them)")
+            .interactive(|s| Ok(Box::new(SelectThen::new(s, "dimreassociate")))),
+        CommandSpec::new("dimdisassociate", "Disassociate Dimensions", run_disassociate)
+            .alias(&["dda"])
+            .params("{handles?}")
+            .interactive(|s| Ok(Box::new(SelectThen::new(s, "dimdisassociate")))),
+        CommandSpec::new("dimtedit.home", "Home", |s, p| run_tedit(s, p, "home")).menu(&["Dimension", "Align Text", "Home"]).params("{handles?}"),
+        CommandSpec::new("dimtedit.angle", "Angle", |s, p| run_tedit(s, p, "angle"))
+            .menu(&["Dimension", "Align Text", "Angle"])
+            .params("{handles?, angle: degrees}"),
+        CommandSpec::new("dimtedit.left", "Left", |s, p| run_tedit(s, p, "left")).menu(&["Dimension", "Align Text", "Left"]).params("{handles?}"),
+        CommandSpec::new("dimtedit.center", "Center", |s, p| run_tedit(s, p, "center"))
+            .menu(&["Dimension", "Align Text", "Center"])
+            .params("{handles?}"),
+        CommandSpec::new("dimtedit.right", "Right", |s, p| run_tedit(s, p, "right")).menu(&["Dimension", "Align Text", "Right"]).params("{handles?}"),
+        CommandSpec::new("dimtedit", "Dimension Text Edit", run_dimtedit)
+            .params("{handles?, at?: [x,y], mode?: home|angle|left|center|right, angle?}"),
+        CommandSpec::new("dimspace", "Dimension Space", run_dimspace)
+            .menu(&["Dimension", "Dimension Space"])
+            .params("{base: hex, handles: [hex], spacing?: number (default DIMDLI)}"),
     ]
 }
 
@@ -93,6 +121,8 @@ fn dim(s: &Session, kind: DimKind, defpt: Vec2, p13: Vec2, p14: Vec2, p15: Vec2,
         text_rotation: 0.0,
         user_text_pos: false,
         block: None,
+        overrides: Default::default(),
+        assoc: Vec::new(),
     })
 }
 
@@ -109,15 +139,70 @@ fn linear_kind(p1: Vec2, p2: Vec2, at: Vec2, rotation: Option<f64>, aligned: boo
     if aligned { DimKind::Aligned } else { DimKind::Linear { rotation: rotation.unwrap_or_else(|| auto_rotation(p1, p2, at)) } }
 }
 
+/// Add a dimension. With DIMASSOC on, definition points that sit on object endpoints,
+/// vertices or centres are attached to them (associative dimensions).
 fn add_dim(s: &mut Session, k: EntityKind) -> Result<Handle> {
+    let mut k = k;
+    if let EntityKind::Dimension(dm) = &mut k
+        && dm.assoc.is_empty()
+        && assoc_enabled(s)
+    {
+        dm.assoc = crate::assoc::reassociate(s.doc()?, &s.space(), dm);
+    }
     let h = s.add_entity(k)?;
     s.last_dim = Some(h);
     Ok(h)
 }
 
+fn assoc_enabled(s: &Session) -> bool {
+    s.doc().map(|d| d.header.i64("DIMASSOC", 2) != 0).unwrap_or(false)
+}
+
+fn with_assoc(k: EntityKind, assoc: Vec<DimAssoc>) -> EntityKind {
+    match k {
+        EntityKind::Dimension(mut d) => {
+            d.assoc = assoc;
+            EntityKind::Dimension(d)
+        }
+        other => other,
+    }
+}
+
+/// Angular dimension between two lines, attached to them (vertex = their intersection).
+fn angular_from_lines(s: &Session, h1: Handle, h2: Handle, at: Vec2) -> Option<EntityKind> {
+    let d = s.doc().ok()?;
+    let line = |h: Handle| match &d.entity(h)?.kind {
+        EntityKind::Line(l) => Some((l.a.xy(), l.b.xy())),
+        _ => None,
+    };
+    let ((a1, a2), (b1, b2)) = (line(h1)?, line(h2)?);
+    let (v, _, _) = cadcraft_geom::line_line_infinite(a1, a2, b1, b2)?;
+    // Use the leg ends on the side of the picked arc location (the quadrant the user meant).
+    let pick = |p: Vec2, q: Vec2, snap_p: AssocSnap, snap_q: AssocSnap| {
+        let dir = if (p - v).len() > (q - v).len() { (p, snap_p) } else { (q, snap_q) };
+        let other = if dir.1 == AssocSnap::Start { (q, AssocSnap::End) } else { (p, AssocSnap::Start) };
+        let side = |x: Vec2| (x - v).normalized().dot((at - v).normalized());
+        if side(other.0) > side(dir.0) && other.0.dist(v) > 1e-9 { other } else { dir }
+    };
+    let (p1, s1) = pick(a1, a2, AssocSnap::Start, AssocSnap::End);
+    let (p2, s2) = pick(b1, b2, AssocSnap::Start, AssocSnap::End);
+    let k = dim(s, DimKind::Angular3P, at, p1, p2, v, Vec2::ZERO, "");
+    let mut assoc = Vec::new();
+    if assoc_enabled(s) {
+        assoc = vec![
+            DimAssoc { point: "p13".into(), handle: h1, snap: s1 },
+            DimAssoc { point: "p14".into(), handle: h2, snap: s2 },
+            DimAssoc { point: "p15".into(), handle: h1, snap: AssocSnap::Intersection { other: h2 } },
+        ];
+    }
+    Some(with_assoc(k, assoc))
+}
+
 fn run_linear(s: &mut Session, p: &Value) -> Result<Value> {
-    let a = point_req("dimlinear", p, "p1")?;
-    let b = point_req("dimlinear", p, "p2")?;
+    let (a, b) = match p.get("object").and_then(|v| v.as_str().and_then(Handle::parse_hex).or_else(|| v.as_u64().map(Handle))) {
+        Some(h) => object_extent(s, h).ok_or_else(|| bad("dimlinear", "`object` must be a line, arc, circle or polyline segment"))?,
+        None => (point_req("dimlinear", p, "p1")?, point_req("dimlinear", p, "p2")?),
+    };
     let at = point_req("dimlinear", p, "at")?;
     let rot = p.get("rotation").and_then(Value::as_f64).map(f64::to_radians);
     let k = dim(s, linear_kind(a, b, at, rot, false), at, a, b, Vec2::ZERO, Vec2::ZERO, str_param(p, "text").unwrap_or(""));
@@ -166,7 +251,28 @@ fn run_diameter(s: &mut Session, p: &Value) -> Result<Value> {
     radial(s, p, true)
 }
 
+fn hex_param(p: &Value, key: &str) -> Option<Handle> {
+    p.get(key).and_then(|v| v.as_str().and_then(Handle::parse_hex).or_else(|| v.as_u64().map(Handle)))
+}
+
 fn run_angular(s: &mut Session, p: &Value) -> Result<Value> {
+    if let Some(ls) = p.get("lines").and_then(Value::as_array) {
+        let hs: Vec<Handle> = ls.iter().filter_map(|v| v.as_str().and_then(Handle::parse_hex).or_else(|| v.as_u64().map(Handle))).collect();
+        let (Some(h1), Some(h2)) = (hs.first(), hs.get(1)) else { return Err(bad("dimangular", "`lines` needs two line handles")) };
+        let at = point_req("dimangular", p, "at")?;
+        let k = angular_from_lines(s, *h1, *h2, at).ok_or_else(|| bad("dimangular", "objects must be two non-parallel lines"))?;
+        return Ok(json!({ "handle": add_dim(s, k)?.hex() }));
+    }
+    if let Some(h) = hex_param(p, "arc") {
+        let at = point_req("dimangular", p, "at")?;
+        let a = match s.doc()?.entity(h).map(|e| e.kind.clone()) {
+            Some(EntityKind::Arc(a)) => a,
+            _ => return Err(bad("dimangular", "object is not an arc")),
+        };
+        let g = cadcraft_geom::Arc::new(a.center.xy(), a.radius, a.start, a.end);
+        let k = dim(s, DimKind::Angular3P, at, g.start_point(), g.end_point(), g.center, Vec2::ZERO, "");
+        return Ok(json!({ "handle": add_dim(s, k)?.hex() }));
+    }
     let v = point_req("dimangular", p, "vertex")?;
     let a = point_req("dimangular", p, "p1")?;
     let b = point_req("dimangular", p, "p2")?;
@@ -219,7 +325,16 @@ fn chained(s: &Session, prev: &Dimension, next: Vec2, baseline: bool) -> EntityK
         let side = if (defpt - prev.p13.xy()).dot(n) >= 0.0 { 1.0 } else { -1.0 };
         defpt += n * (spacing * side);
     }
-    EntityKind::Dimension(Dimension { p13: v3(first), p14: v3(next), defpt: v3(defpt), text: String::new(), block: None, ..prev.clone() })
+    EntityKind::Dimension(Dimension {
+        p13: v3(first),
+        p14: v3(next),
+        defpt: v3(defpt),
+        text: String::new(),
+        block: None,
+        assoc: Vec::new(),
+        user_text_pos: false,
+        ..prev.clone()
+    })
 }
 
 fn chain_run(s: &mut Session, p: &Value, baseline: bool) -> Result<Value> {
@@ -280,7 +395,8 @@ fn run_qdim(s: &mut Session, p: &Value) -> Result<Value> {
 fn mleader_kind(s: &Session, pts: &[Vec2], text: &str) -> Option<EntityKind> {
     let (landing, arrow_pts) = pts.split_last()?;
     let d = s.doc().ok()?;
-    let st = d.mleader_styles.first().cloned().unwrap_or_default();
+    let cur = d.header.str("CMLEADERSTYLE", "Standard");
+    let st = d.mleader_styles.iter().find(|m| m.name.eq_ignore_ascii_case(&cur)).or(d.mleader_styles.first()).cloned().unwrap_or_default();
     let k = d.header.f64("DIMSCALE", 1.0);
     let th = st.text_height * k;
     let dir = if arrow_pts.first().is_some_and(|a| a.x > landing.x) { -1.0 } else { 1.0 };
@@ -363,19 +479,307 @@ fn run_update(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "updated": n }))
 }
 
+/// DIMOVERRIDE: per-dimension style overrides (`clear` removes them); `text` sets the text.
 fn run_override(s: &mut Session, p: &Value) -> Result<Value> {
-    let hs = targets(s, p)?;
-    let t = str_param(p, "text").unwrap_or("").to_string();
+    if p.get("text").is_some() && p.as_object().is_some_and(|o| o.keys().all(|k| matches!(k.as_str(), "text" | "handles" | "handle"))) {
+        let hs = targets(s, p)?;
+        let t = str_param(p, "text").unwrap_or("").to_string();
+        let d = s.doc_mut()?;
+        for h in &hs {
+            let _ = d.modify_entity(*h, |e| {
+                if let EntityKind::Dimension(dm) = &mut e.kind {
+                    dm.text = t.clone();
+                    dm.block = None;
+                }
+            });
+        }
+        return Ok(json!({ "changed": hs.len() }));
+    }
+    super::props::dim_override(s, p)
+}
+
+/// The two points a picked object is dimensioned between (DIMLINEAR "select object").
+fn object_extent(s: &Session, h: Handle) -> Option<(Vec2, Vec2)> {
+    let e = s.doc().ok()?.entity(h)?;
+    if let Some((c, r)) = circle_of(s, h).filter(|_| matches!(e.kind, EntityKind::Circle(_))) {
+        return Some((c - Vec2::X * r, c + Vec2::X * r));
+    }
+    e.kind.prims().into_iter().find_map(|pr| match pr {
+        Prim::Seg(sg @ (Segment::Line(_) | Segment::Arc { .. })) => Some((sg.start(), sg.end())),
+        _ => None,
+    })
+}
+
+fn dims_of(s: &Session, hs: &[Handle]) -> Vec<Handle> {
+    let Ok(d) = s.doc() else { return Vec::new() };
+    hs.iter().copied().filter(|h| d.entity(*h).is_some_and(|e| matches!(e.kind, EntityKind::Dimension(_)))).collect()
+}
+
+fn run_reassociate(s: &mut Session, p: &Value) -> Result<Value> {
+    let hs = dims_of(s, &targets(s, p)?);
+    let space = s.space();
+    let mut plan = Vec::new();
+    {
+        let d = s.doc()?;
+        for h in &hs {
+            if let Some(EntityKind::Dimension(dm)) = d.entity(*h).map(|e| &e.kind) {
+                plan.push((*h, crate::assoc::reassociate(d, &space, dm)));
+            }
+        }
+    }
+    let mut points = 0;
+    let mut n = 0;
     let d = s.doc_mut()?;
-    for h in &hs {
-        let _ = d.modify_entity(*h, |e| {
+    for (h, a) in plan {
+        points += a.len();
+        n += usize::from(!a.is_empty());
+        let _ = d.modify_entity(h, |e| {
             if let EntityKind::Dimension(dm) = &mut e.kind {
-                dm.text = t.clone();
-                dm.block = None;
+                dm.assoc = a;
             }
         });
     }
+    Ok(json!({ "dimensions": hs.len(), "associated": n, "points": points, "message": format!("{n} of {} dimension(s) associated.", hs.len()) }))
+}
+
+fn run_disassociate(s: &mut Session, p: &Value) -> Result<Value> {
+    let hs = dims_of(s, &targets(s, p)?);
+    let d = s.doc_mut()?;
+    let mut n = 0;
+    for h in &hs {
+        let _ = d.modify_entity(*h, |e| {
+            if let EntityKind::Dimension(dm) = &mut e.kind
+                && !dm.assoc.is_empty()
+            {
+                dm.assoc.clear();
+                n += 1;
+            }
+        });
+    }
+    Ok(json!({ "disassociated": n, "message": format!("{n} disassociated.") }))
+}
+
+/// DIMTEDIT: move/rotate/justify dimension text.
+fn run_tedit(s: &mut Session, p: &Value, mode: &str) -> Result<Value> {
+    let mut q = p.as_object().cloned().unwrap_or_default();
+    q.insert("mode".into(), json!(mode));
+    run_dimtedit(s, &Value::Object(q))
+}
+
+fn run_dimtedit(s: &mut Session, p: &Value) -> Result<Value> {
+    let hs = dims_of(s, &targets(s, p)?);
+    if hs.is_empty() {
+        return Err(bad("dimtedit", "select dimensions"));
+    }
+    let mode = str_param(p, "mode").unwrap_or("").to_ascii_lowercase();
+    let at = point_param(p, "at");
+    let angle = p.get("angle").and_then(Value::as_f64).filter(|a| a.is_finite()).map(f64::to_radians);
+    if mode == "angle" && angle.is_none() {
+        return Err(bad("dimtedit", "`angle` (degrees) is required"));
+    }
+    let d = s.doc_mut()?;
+    for h in &hs {
+        d.modify_entity(*h, |e| {
+            let EntityKind::Dimension(dm) = &mut e.kind else { return };
+            dm.block = None;
+            if let Some(q) = at {
+                dm.text_mid = v3(q);
+                dm.user_text_pos = true;
+            }
+            match mode.as_str() {
+                "home" => {
+                    dm.user_text_pos = false;
+                    dm.text_rotation = 0.0;
+                    dm.overrides.remove("textJust");
+                }
+                "angle" => dm.text_rotation = angle.unwrap_or(0.0),
+                "left" | "center" | "right" => {
+                    dm.user_text_pos = false;
+                    let j = match mode.as_str() {
+                        "left" => 1,
+                        "right" => 2,
+                        _ => 0,
+                    };
+                    dm.overrides.insert("textJust".into(), json!(j));
+                }
+                _ => {}
+            }
+        })?;
+    }
     Ok(json!({ "changed": hs.len() }))
+}
+
+/// DIMSPACE: equal spacing of parallel linear dimensions from a base dimension.
+fn run_dimspace(s: &mut Session, p: &Value) -> Result<Value> {
+    let base = hex_param(p, "base").ok_or_else(|| bad("dimspace", "`base` dimension is required"))?;
+    let hs: Vec<Handle> = dims_of(s, &targets(s, p)?).into_iter().filter(|h| *h != base).collect();
+    let d = s.doc()?;
+    let Some(EntityKind::Dimension(b)) = d.entity(base).map(|e| e.kind.clone()) else { return Err(bad("dimspace", "`base` is not a dimension")) };
+    let st = d.dim_style(&b.style).cloned().unwrap_or_default().with_overrides(&b.overrides);
+    let spacing =
+        p.get("spacing").and_then(Value::as_f64).filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(st.baseline_spacing * st.scale.max(1e-9) * 2.0);
+    let dir = match b.kind {
+        DimKind::Linear { rotation } => Vec2::from_angle(rotation),
+        DimKind::Aligned => (b.p14.xy() - b.p13.xy()).normalized(),
+        _ => return Err(bad("dimspace", "base must be a linear or aligned dimension")),
+    };
+    let n = dir.perp();
+    let base_off = (b.defpt.xy() - b.p13.xy()).dot(n);
+    let side = if base_off >= 0.0 { 1.0 } else { -1.0 };
+    // Order the others by their current distance from the base line.
+    let mut others: Vec<(Handle, f64)> = hs
+        .iter()
+        .filter_map(|h| match d.entity(*h).map(|e| &e.kind) {
+            Some(EntityKind::Dimension(o)) if matches!(o.kind, DimKind::Linear { .. } | DimKind::Aligned) => {
+                Some((*h, (o.defpt.xy() - b.defpt.xy()).dot(n) * side))
+            }
+            _ => None,
+        })
+        .collect();
+    others.sort_by(|a, c| a.1.total_cmp(&c.1));
+    let line_pt = b.defpt.xy();
+    let dm = s.doc_mut()?;
+    for (i, (h, _)) in others.iter().enumerate() {
+        let target = line_pt + n * (side * spacing * (i as f64 + 1.0));
+        dm.modify_entity(*h, |e| {
+            if let EntityKind::Dimension(o) = &mut e.kind {
+                let cur = o.defpt.xy();
+                let moved = cur + n * (target - cur).dot(n);
+                o.defpt = v3(moved);
+                o.user_text_pos = false;
+                o.block = None;
+            }
+        })?;
+    }
+    Ok(json!({ "spaced": others.len() }))
+}
+
+/// Select objects, then run a JSON command on them.
+struct SelectThen {
+    sel: super::machines::SelectPhase,
+    id: &'static str,
+}
+
+impl SelectThen {
+    fn new(_s: &Session, id: &'static str) -> Self {
+        SelectThen { sel: super::machines::SelectPhase::default(), id }
+    }
+    fn run(&self, s: &mut Session, hs: Vec<Handle>) -> Result<Step> {
+        let hex: Vec<String> = hs.iter().map(|h| h.hex()).collect();
+        let r = s.execute(self.id, &json!({ "handles": hex }))?;
+        if let Some(m) = r.get("message").and_then(Value::as_str) {
+            s.echo(m.to_string());
+        }
+        Ok(Step::Done)
+    }
+}
+
+impl Interactive for SelectThen {
+    fn name(&self) -> &'static str {
+        if self.id == "dimreassociate" { "DIMREASSOCIATE" } else { "DIMDISASSOCIATE" }
+    }
+    fn begin(&mut self, s: &mut Session) -> Result<Step> {
+        self.sel = super::machines::SelectPhase::begin(s);
+        if self.sel.done {
+            let hs = self.sel.picked.clone();
+            return self.run(s, hs);
+        }
+        Ok(Step::Continue)
+    }
+    fn prompt(&self, _s: &Session) -> Prompt {
+        self.sel.prompt()
+    }
+    fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
+        match self.sel.feed(s, &i)? {
+            super::machines::SelOutcome::More => Ok(Step::Continue),
+            super::machines::SelOutcome::Empty => Ok(Step::Done),
+            super::machines::SelOutcome::Done(hs) => self.run(s, hs),
+        }
+    }
+    fn preview(&self, _s: &Session, _c: Vec2) -> Vec<EntityKind> {
+        Vec::new()
+    }
+}
+
+/// DIMOVERRIDE at the command line: variable, value (repeat), Enter, then select dimensions.
+struct OverrideM {
+    vars: serde_json::Map<String, Value>,
+    var: Option<String>,
+    clear: bool,
+    selecting: Option<super::machines::SelectPhase>,
+}
+
+impl OverrideM {
+    fn new(_s: &Session) -> Self {
+        OverrideM { vars: serde_json::Map::new(), var: None, clear: false, selecting: None }
+    }
+    fn apply(&self, s: &mut Session, hs: Vec<Handle>) -> Result<Step> {
+        let mut p = self.vars.clone();
+        p.insert("handles".into(), json!(hs.iter().map(|h| h.hex()).collect::<Vec<_>>()));
+        if self.clear {
+            p.insert("clear".into(), json!(true));
+        }
+        let r = super::props::dim_override(s, &Value::Object(p))?;
+        s.echo(format!("{} dimension(s) changed.", r.get("changed").and_then(Value::as_u64).unwrap_or(0)));
+        Ok(Step::Done)
+    }
+}
+
+impl Interactive for OverrideM {
+    fn name(&self) -> &'static str {
+        "DIMOVERRIDE"
+    }
+    fn prompt(&self, _s: &Session) -> Prompt {
+        if let Some(sel) = &self.selecting {
+            return sel.prompt();
+        }
+        match &self.var {
+            Some(v) => Prompt::new(format!("Enter new value for dimension variable {}", v.to_ascii_uppercase()), Accept::TEXT),
+            None => Prompt::new("Enter dimension variable name to override", Accept::TEXT).kw(&["Clear overrides"]),
+        }
+    }
+    fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
+        if let Some(sel) = &mut self.selecting {
+            return match sel.feed(s, &i)? {
+                super::machines::SelOutcome::More => Ok(Step::Continue),
+                super::machines::SelOutcome::Empty => Ok(Step::Done),
+                super::machines::SelOutcome::Done(hs) => self.apply(s, hs),
+            };
+        }
+        match (self.var.take(), i) {
+            (None, Input::Keyword(k)) if k.starts_with("Clear") => {
+                self.clear = true;
+                self.selecting = Some(super::machines::SelectPhase::default());
+            }
+            (None, Input::Text(t)) => {
+                let t = t.trim().to_string();
+                if t.eq_ignore_ascii_case("c") {
+                    self.clear = true;
+                    self.selecting = Some(super::machines::SelectPhase::default());
+                } else if cadcraft_doc::DimStyle::field_name(&t).is_some() {
+                    self.var = Some(t);
+                } else {
+                    s.echo(format!("Unknown dimension variable \"{t}\"."));
+                }
+            }
+            (None, Input::Enter) => {
+                if self.vars.is_empty() {
+                    return Ok(Step::Cancel);
+                }
+                self.selecting = Some(super::machines::SelectPhase::default());
+            }
+            (Some(v), Input::Text(t)) => {
+                let val = t.trim().parse::<f64>().map(|x| json!(x)).unwrap_or_else(|_| json!(t.trim()));
+                self.vars.insert(v, val);
+            }
+            (Some(v), _) => self.var = Some(v),
+            _ => {}
+        }
+        Ok(Step::Continue)
+    }
+    fn preview(&self, _s: &Session, _c: Vec2) -> Vec<EntityKind> {
+        Vec::new()
+    }
 }
 
 // ---------------- interactive ----------------
@@ -464,7 +868,7 @@ impl Interactive for LinearM {
                 Ok(Step::Continue)
             }
             (_, Input::Point(at)) => {
-                let (a, b) = (self.pts[0], self.pts[1]);
+                let (Some(&a), Some(&b)) = (self.pts.first(), self.pts.get(1)) else { return Ok(Step::Continue) };
                 let k = dim(s, linear_kind(a, b, at, self.rotation, self.aligned), at, a, b, Vec2::ZERO, Vec2::ZERO, &self.text);
                 add_dim(s, k)?;
                 if let Some(EntityKind::Dimension(d)) = s.last_dim.and_then(|h| s.doc().ok()?.entity(h).map(|e| e.kind.clone())) {
@@ -548,6 +952,7 @@ impl Interactive for RadialM {
 
 #[derive(Default)]
 struct AngularM {
+    handles: Vec<Handle>,
     first: Option<(Vec2, Vec2)>,
     second: Option<(Vec2, Vec2)>,
     vertex_mode: Vec<Vec2>,
@@ -597,7 +1002,12 @@ impl Interactive for AngularM {
         if let Some((v, a, b)) = self.geometry() {
             return match i {
                 Input::Point(at) => {
-                    add_dim(s, dim(s, DimKind::Angular3P, at, a, b, v, Vec2::ZERO, ""))?;
+                    let k = match (self.handles.as_slice(), self.arc) {
+                        ([h1, h2], None) => angular_from_lines(s, *h1, *h2, at),
+                        _ => None,
+                    };
+                    let k = k.unwrap_or_else(|| dim(s, DimKind::Angular3P, at, a, b, v, Vec2::ZERO, ""));
+                    add_dim(s, k)?;
                     Ok(Step::Done)
                 }
                 Input::Enter => Ok(Step::Cancel),
@@ -629,6 +1039,7 @@ impl Interactive for AngularM {
                         self.arc = Some((g.center, g.start_point(), g.end_point()));
                     }
                     Some(EntityKind::Line(l)) => {
+                        self.handles.push(h);
                         let seg = (l.a.xy(), l.b.xy());
                         if self.first.is_none() {
                             self.first = Some(seg);
@@ -842,3 +1253,7 @@ impl Interactive for MLeaderM {
         mleader_kind(s, &pts, "").into_iter().collect()
     }
 }
+
+#[cfg(test)]
+#[path = "annotate_tests.rs"]
+mod tests;

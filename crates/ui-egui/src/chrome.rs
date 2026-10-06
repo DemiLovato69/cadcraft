@@ -263,8 +263,23 @@ pub fn status_bar(app: &mut CadApp, ui: &mut egui::Ui) {
                 cadcraft_engine::units::format_distance(0.0, lu, lp)
             )
         });
+        // MODEL / PAPER (layouts only): toggles MSPACE and PSPACE like AutoCAD's status button.
+        let mut coord_right = rx - 8.0;
+        if matches!(app.session.layout_space(), cadcraft_doc::Space::Paper(_)) {
+            let model = app.session.state().is_ok_and(|st| st.mspace.is_some());
+            let label = if model { "MODEL" } else { "PAPER" };
+            let br = Rect::from_min_max(pos2(rx - 60.0, r.center().y - 9.0), pos2(rx - 6.0, r.center().y + 9.0));
+            let resp = ui.interact(br, ui.id().with("mspace_toggle"), Sense::click());
+            p.rect_filled(br, 3.0, if resp.hovered() { t.control_hover } else { t.toggle_on.gamma_multiply(0.25) });
+            p.text(br.center(), egui::Align2::CENTER_CENTER, label, crate::theme::small(), t.text);
+            if resp.on_hover_text("Switch between model space in a viewport and paper space").clicked() {
+                let _ = app.run(if model { "pspace" } else { "mspace" }, json!({}));
+                app.canvas.list = None;
+            }
+            coord_right = br.left() - 10.0;
+        }
         if let Some(c) = coord {
-            p.text(pos2(rx - 8.0, r.center().y), egui::Align2::RIGHT_CENTER, c, crate::theme::body(), t.text);
+            p.text(pos2(coord_right, r.center().y), egui::Align2::RIGHT_CENTER, c, crate::theme::body(), t.text);
         }
         let _ = coords_w;
         let mut toggle_cmd = None;

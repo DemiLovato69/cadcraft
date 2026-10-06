@@ -6,6 +6,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
+mod constraint;
 mod entity;
 mod extents;
 mod header;
@@ -17,6 +18,7 @@ use std::collections::BTreeMap;
 
 pub use cadcraft_color as color;
 pub use cadcraft_geom as geom;
+pub use constraint::*;
 pub use entity::*;
 pub use extents::{MAX_BLOCK_DEPTH, entity_bounds};
 pub use header::{HVal, Header};
@@ -62,6 +64,10 @@ pub struct Drawing {
     pub ucss: Vec<Ucs>,
     pub layer_states: Vec<LayerState>,
     pub groups: Vec<Group>,
+    /// Parametric constraints (GEOMCONSTRAINT / DIMCONSTRAINT).
+    pub constraints: Vec<Constraint>,
+    /// User parameters and parametric settings.
+    pub parametric: Parametric,
     /// Next free handle.
     pub handseed: u64,
 }
@@ -107,6 +113,8 @@ impl Drawing {
             ucss: Vec::new(),
             layer_states: Vec::new(),
             groups: Vec::new(),
+            constraints: Vec::new(),
+            parametric: Parametric::default(),
             handseed: 0x100,
         }
     }

@@ -3,6 +3,7 @@
 
 mod annotate;
 mod blocks;
+pub mod constraints;
 mod draw;
 mod draw2;
 mod edit;
@@ -16,6 +17,7 @@ mod modify;
 mod modify2;
 mod props;
 mod settings;
+mod table;
 mod utility;
 mod view;
 
@@ -161,6 +163,8 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(inquiry::specs());
         v.extend(settings::specs());
         v.extend(utility::specs());
+        v.extend(table::specs());
+        v.extend(constraints::specs());
         v
     })
 }

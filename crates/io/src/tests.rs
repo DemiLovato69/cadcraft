@@ -90,6 +90,8 @@ fn sample() -> Drawing {
             text_rotation: 0.0,
             user_text_pos: false,
             block: None,
+            overrides: Default::default(),
+            assoc: Vec::new(),
         }),
     )
     .unwrap();

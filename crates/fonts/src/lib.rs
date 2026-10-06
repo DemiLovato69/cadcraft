@@ -11,9 +11,11 @@ mod mtext;
 mod stroke;
 pub mod ttf;
 
+use std::sync::Arc;
+
 use cadcraft_geom::{Bounds2, Vec2};
 
-pub use mtext::{MTextLayout, layout_mtext, plain_mtext};
+pub use mtext::{MTextColor, MTextLayout, MTextParams, MTextPiece, layout_mtext, layout_mtext_with, plain_mtext};
 
 /// Name of the built-in font.
 pub const BUILTIN_FONT: &str = "CADCraft Stroke";
@@ -144,6 +146,116 @@ pub fn line_width(s: &str, height: f64, width_factor: f64) -> f64 {
     (n * height * width_factor - stroke::GAP / stroke::CAP * height * width_factor).max(0.0)
 }
 
+/// The font a piece of text is set in: the built-in stroke font or an installed TrueType /
+/// OpenType font (outlines).
+#[derive(Clone, Debug, Default)]
+pub enum TextFont {
+    #[default]
+    Stroke,
+    Outline(Arc<Vec<u8>>),
+}
+
+impl TextFont {
+    /// Resolve a text style font name: an installed TTF/OTF when found, else the stroke font.
+    pub fn resolve(name: &str) -> TextFont {
+        ttf::find(name).map(TextFont::Outline).unwrap_or(TextFont::Stroke)
+    }
+    pub fn is_outline(&self) -> bool {
+        matches!(self, TextFont::Outline(_))
+    }
+}
+
+/// Shaped text in local or world coordinates: open strokes (stroke-font glyphs, underlines,
+/// fraction bars) and closed glyph outlines grouped per glyph (fill each group even-odd).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Shaped {
+    pub strokes: Vec<Vec<Vec2>>,
+    pub glyphs: Vec<Vec<Vec<Vec2>>>,
+    pub width: f64,
+}
+
+impl Shaped {
+    /// Apply a point transform to every vertex.
+    pub fn map(&mut self, f: impl Fn(Vec2) -> Vec2) {
+        for s in &mut self.strokes {
+            for p in s.iter_mut() {
+                *p = f(*p);
+            }
+        }
+        for g in &mut self.glyphs {
+            for c in g.iter_mut() {
+                for p in c.iter_mut() {
+                    *p = f(*p);
+                }
+            }
+        }
+    }
+    /// Append another shaped piece (already in the same coordinates).
+    pub fn extend(&mut self, other: Shaped) {
+        self.strokes.extend(other.strokes);
+        self.glyphs.extend(other.glyphs);
+    }
+    pub fn is_empty(&self) -> bool {
+        self.strokes.is_empty() && self.glyphs.is_empty()
+    }
+    /// All geometry as polylines (outlines become closed polylines).
+    pub fn outlines(&self) -> Vec<Vec<Vec2>> {
+        let mut v = self.strokes.clone();
+        v.extend(self.glyphs.iter().flatten().cloned());
+        v
+    }
+}
+
+/// Underline / overline strokes from per-character spans `(x0, x1, underline, overline)`.
+pub(crate) fn decorations(spans: &[(f64, f64, bool, bool)], h: f64) -> Vec<Vec<Vec2>> {
+    let mut out = Vec::new();
+    for (which, y) in [(0usize, -h * 0.2), (1usize, h * 1.2)] {
+        let mut start: Option<f64> = None;
+        let mut end = 0.0;
+        for (x0, x1, u, o) in spans {
+            let on = if which == 0 { *u } else { *o };
+            match (on, start) {
+                (true, None) => {
+                    start = Some(*x0);
+                    end = *x1;
+                }
+                (true, Some(_)) => end = *x1,
+                (false, Some(sx)) => {
+                    out.push(vec![Vec2::new(sx, y), Vec2::new(end, y)]);
+                    start = None;
+                }
+                (false, None) => {}
+            }
+        }
+        if let Some(sx) = start {
+            out.push(vec![Vec2::new(sx, y), Vec2::new(end, y)]);
+        }
+    }
+    out
+}
+
+/// Shape one line in `font` (baseline at y = 0, x from 0). TrueType fonts that fail to parse
+/// fall back to the stroke font.
+pub fn shape_line(font: &TextFont, s: &str, height: f64, width_factor: f64, oblique: f64) -> Shaped {
+    if let TextFont::Outline(bytes) = font
+        && let Some(sh) = ttf::shape(bytes, s, height, width_factor, oblique)
+    {
+        return sh;
+    }
+    let run = layout_line(s, height, width_factor, oblique);
+    Shaped { strokes: run.strokes, glyphs: Vec::new(), width: run.width }
+}
+
+/// Width of one line in `font`.
+pub fn text_width(font: &TextFont, s: &str, height: f64, width_factor: f64) -> f64 {
+    if let TextFont::Outline(bytes) = font
+        && let Some(w) = ttf::width(bytes, s, height, width_factor)
+    {
+        return w;
+    }
+    line_width(s, height, width_factor)
+}
+
 /// Horizontal / vertical alignment for single-line text (matches DXF 72/73 semantics).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Align {
@@ -167,7 +279,100 @@ pub enum VAlign {
     Top,
 }
 
-/// Place a single-line TEXT in world coordinates. Returns strokes and the text's bounding box.
+/// Single-line text placement: insertion, alignment, rotation and the text style's
+/// generation flags. Shared by the stroke and TrueType fonts.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextParams {
+    pub insert: Vec2,
+    pub align_pt: Option<Vec2>,
+    pub height: f64,
+    pub rotation: f64,
+    pub width_factor: f64,
+    pub oblique: f64,
+    pub h: Align,
+    pub v: VAlign,
+    /// Mirrored in X (text style "Backwards").
+    pub backwards: bool,
+    /// Mirrored in Y (text style "Upside down").
+    pub upside_down: bool,
+}
+
+impl TextParams {
+    pub fn new(insert: Vec2, height: f64) -> Self {
+        TextParams {
+            insert,
+            align_pt: None,
+            height,
+            rotation: 0.0,
+            width_factor: 1.0,
+            oblique: 0.0,
+            h: Align::Left,
+            v: VAlign::Baseline,
+            backwards: false,
+            upside_down: false,
+        }
+    }
+    /// Centred on `p` both ways (dimension and table text).
+    pub fn centered(p: Vec2, height: f64, rotation: f64) -> Self {
+        TextParams { align_pt: Some(p), rotation, h: Align::Middle, v: VAlign::Middle, ..TextParams::new(p, height) }
+    }
+}
+
+/// Place a single-line TEXT in world coordinates with any font. Returns the shaped text and its
+/// bounding box.
+pub fn place(font: &TextFont, s: &str, p: &TextParams) -> (Shaped, Bounds2) {
+    let mut height = if p.height > 0.0 && p.height.is_finite() { p.height } else { 1.0 };
+    let mut wf = p.width_factor;
+    let mut rot = if p.rotation.is_finite() { p.rotation } else { 0.0 };
+    let insert = p.insert;
+    if matches!(p.h, Align::Aligned | Align::Fit)
+        && let Some(p2) = p.align_pt
+    {
+        let len = insert.dist(p2);
+        rot = insert.angle_to(p2);
+        let w = text_width(font, s, height, wf);
+        if w > 1e-12 && len > 1e-12 {
+            let k = len / w;
+            if p.h == Align::Aligned {
+                height *= k;
+            } else {
+                wf *= k;
+            }
+        }
+    }
+    let mut sh = shape_line(font, s, height, wf, p.oblique);
+    let width = sh.width;
+    let origin = match p.h {
+        Align::Left | Align::Aligned | Align::Fit => insert,
+        _ => p.align_pt.unwrap_or(insert),
+    };
+    let dx = match p.h {
+        Align::Left | Align::Aligned | Align::Fit => 0.0,
+        Align::Center | Align::Middle => -width / 2.0,
+        Align::Right => -width,
+    };
+    let dy = match (p.h, p.v) {
+        (Align::Middle, _) => -height / 2.0,
+        (_, VAlign::Baseline) => 0.0,
+        (_, VAlign::Bottom) => height / 3.0,
+        (_, VAlign::Middle) => -height / 2.0,
+        (_, VAlign::Top) => -height,
+    };
+    let local = Vec2::new(dx, dy);
+    let (mx, my) = (if p.backwards { -1.0 } else { 1.0 }, if p.upside_down { -1.0 } else { 1.0 });
+    let xf = |q: Vec2| {
+        let l = q + local;
+        origin + Vec2::new(l.x * mx, l.y * my).rotate(rot)
+    };
+    sh.map(xf);
+    let bb = Bounds2::from_points(
+        [Vec2::new(0.0, -height / 3.0), Vec2::new(width, -height / 3.0), Vec2::new(width, height), Vec2::new(0.0, height)].map(xf),
+    );
+    (sh, bb)
+}
+
+/// Place a single-line TEXT in world coordinates with the stroke font. Returns strokes and the
+/// text's bounding box.
 #[allow(clippy::too_many_arguments)]
 pub fn place_text(
     s: &str,
@@ -180,52 +385,9 @@ pub fn place_text(
     h: Align,
     v: VAlign,
 ) -> (Vec<Vec<Vec2>>, Bounds2) {
-    let mut height = if height > 0.0 && height.is_finite() { height } else { 1.0 };
-    let mut wf = width_factor;
-    let mut rot = rotation;
-    let mut origin = insert;
-    if matches!(h, Align::Aligned | Align::Fit)
-        && let Some(p2) = align_pt
-    {
-        let len = insert.dist(p2);
-        rot = insert.angle_to(p2);
-        let w = line_width(s, height, wf);
-        if w > 1e-12 && len > 1e-12 {
-            let k = len / w;
-            if h == Align::Aligned {
-                height *= k;
-            } else {
-                wf *= k;
-            }
-        }
-    }
-    let run = layout_line(s, height, wf, oblique);
-    let anchor = match h {
-        Align::Left | Align::Aligned | Align::Fit => insert,
-        _ => align_pt.unwrap_or(insert),
-    };
-    let dx = match h {
-        Align::Left | Align::Aligned | Align::Fit => 0.0,
-        Align::Center | Align::Middle => -run.width / 2.0,
-        Align::Right => -run.width,
-    };
-    let dy = match (h, v) {
-        (Align::Middle, _) => -height / 2.0,
-        (_, VAlign::Baseline) => 0.0,
-        (_, VAlign::Bottom) => height / 3.0,
-        (_, VAlign::Middle) => -height / 2.0,
-        (_, VAlign::Top) => -height,
-    };
-    if !matches!(h, Align::Left | Align::Aligned | Align::Fit) {
-        origin = anchor;
-    }
-    let local = Vec2::new(dx, dy);
-    let xf = |p: Vec2| origin + (p + local).rotate(rot);
-    let strokes: Vec<Vec<Vec2>> = run.strokes.iter().map(|st| st.iter().map(|p| xf(*p)).collect()).collect();
-    let bb = Bounds2::from_points(
-        [Vec2::new(0.0, -height / 3.0), Vec2::new(run.width, -height / 3.0), Vec2::new(run.width, height), Vec2::new(0.0, height)].map(xf),
-    );
-    (strokes, bb)
+    let p = TextParams { insert, align_pt, height, rotation, width_factor, oblique, h, v, backwards: false, upside_down: false };
+    let (sh, bb) = place(&TextFont::Stroke, s, &p);
+    (sh.strokes, bb)
 }
 
 #[cfg(test)]

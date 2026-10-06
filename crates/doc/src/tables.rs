@@ -185,7 +185,83 @@ pub struct DimStyle {
     /// DIMDLI baseline spacing.
     pub baseline_spacing: f64,
     pub annotative: bool,
+    /// DIMBLK1 / DIMBLK2: per-end arrowheads ("" = use `arrow_block`).
+    pub arrow_block1: String,
+    pub arrow_block2: String,
+    /// DIMDLE dimension line extension past the extension lines (ticks / oblique arrows).
+    pub dim_line_extend: f64,
+    /// DIMJUST: 0 centred, 1 next to ext line 1, 2 next to ext line 2, 3 over ext line 1, 4 over ext line 2.
+    pub text_just: u8,
+    /// DIMRND rounding increment (0 = none).
+    pub round: f64,
+    /// DIMDSEP decimal separator.
+    pub decimal_separator: String,
+    /// DIMFRAC: 0 horizontal stack, 1 diagonal stack, 2 not stacked.
+    pub fraction_format: u8,
+    /// DIMLIM: show limits (upper over lower) instead of the measurement.
+    pub limits: bool,
+    /// DIMTDEC tolerance decimals.
+    pub tol_decimals: u8,
+    /// DIMTFAC tolerance text height relative to the dimension text.
+    pub tol_scale: f64,
+    /// DIMALT alternate units, DIMALTF factor, DIMALTD decimals, DIMAPOST template.
+    pub alt: bool,
+    pub alt_factor: f64,
+    pub alt_decimals: u8,
+    pub alt_post: String,
+    /// DIMAUNIT: 0 decimal degrees, 1 deg/min/sec, 2 grads, 3 radians.
+    pub angular_unit: u8,
+    /// DIMSE1 / DIMSE2 suppress extension lines.
+    pub suppress_ext1: bool,
+    pub suppress_ext2: bool,
 }
+
+/// DIMSTYLE system variable names and the [`DimStyle`] fields they set.
+pub const DIMVARS: &[(&str, &str)] = &[
+    ("DIMSCALE", "scale"),
+    ("DIMASZ", "arrowSize"),
+    ("DIMEXO", "extOffset"),
+    ("DIMEXE", "extExtend"),
+    ("DIMTXT", "textHeight"),
+    ("DIMGAP", "textGap"),
+    ("DIMDEC", "decimals"),
+    ("DIMADEC", "angularDecimals"),
+    ("DIMLFAC", "linearFactor"),
+    ("DIMTAD", "textAbove"),
+    ("DIMTIH", "textInsideHorizontal"),
+    ("DIMTOH", "textOutsideHorizontal"),
+    ("DIMBLK", "arrowBlock"),
+    ("DIMBLK1", "arrowBlock1"),
+    ("DIMBLK2", "arrowBlock2"),
+    ("DIMTSZ", "tickSize"),
+    ("DIMCLRD", "dimLineColor"),
+    ("DIMCLRE", "extLineColor"),
+    ("DIMCLRT", "textColor"),
+    ("DIMTXSTY", "textStyle"),
+    ("DIMPOST", "post"),
+    ("DIMCEN", "centerMark"),
+    ("DIMZIN", "zeroSuppression"),
+    ("DIMLUNIT", "linearUnit"),
+    ("DIMTOL", "tolerance"),
+    ("DIMTP", "tolPlus"),
+    ("DIMTM", "tolMinus"),
+    ("DIMDLI", "baselineSpacing"),
+    ("DIMDLE", "dimLineExtend"),
+    ("DIMJUST", "textJust"),
+    ("DIMRND", "round"),
+    ("DIMDSEP", "decimalSeparator"),
+    ("DIMFRAC", "fractionFormat"),
+    ("DIMLIM", "limits"),
+    ("DIMTDEC", "tolDecimals"),
+    ("DIMTFAC", "tolScale"),
+    ("DIMALT", "alt"),
+    ("DIMALTF", "altFactor"),
+    ("DIMALTD", "altDecimals"),
+    ("DIMAPOST", "altPost"),
+    ("DIMAUNIT", "angularUnit"),
+    ("DIMSE1", "suppressExt1"),
+    ("DIMSE2", "suppressExt2"),
+];
 
 impl Default for DimStyle {
     fn default() -> Self {
@@ -218,11 +294,100 @@ impl Default for DimStyle {
             tol_minus: 0.0,
             baseline_spacing: 0.38,
             annotative: false,
+            arrow_block1: String::new(),
+            arrow_block2: String::new(),
+            dim_line_extend: 0.0,
+            text_just: 0,
+            round: 0.0,
+            decimal_separator: ".".into(),
+            fraction_format: 0,
+            limits: false,
+            tol_decimals: 4,
+            tol_scale: 1.0,
+            alt: false,
+            alt_factor: 25.4,
+            alt_decimals: 2,
+            alt_post: String::new(),
+            angular_unit: 0,
+            suppress_ext1: false,
+            suppress_ext2: false,
         }
     }
 }
 
 impl DimStyle {
+    /// The field a name refers to: a camelCase field name or a DIM* variable name.
+    pub fn field_name(name: &str) -> Option<&'static str> {
+        DIMVARS
+            .iter()
+            .find(|(var, field)| var.eq_ignore_ascii_case(name) || field.eq_ignore_ascii_case(name))
+            .map(|(_, f)| *f)
+            .or_else(|| ["name", "annotative"].into_iter().find(|f| f.eq_ignore_ascii_case(name)))
+    }
+
+    /// Set fields from a JSON object of field or DIM* variable names (numbers, booleans as
+    /// 0/1, colours as ACI numbers or names). Returns the names that were not recognised or
+    /// had unusable values.
+    pub fn apply_fields(&mut self, src: &serde_json::Map<String, serde_json::Value>) -> Vec<String> {
+        use serde_json::Value;
+        let mut rejected = Vec::new();
+        let Ok(mut cur) = serde_json::to_value(&*self) else { return src.keys().cloned().collect() };
+        for (k, v) in src {
+            let Some(field) = DimStyle::field_name(k).filter(|f| *f != "name") else {
+                rejected.push(k.clone());
+                continue;
+            };
+            let Some(obj) = cur.as_object_mut() else { break };
+            let Some(old) = obj.get(field).cloned() else {
+                rejected.push(k.clone());
+                continue;
+            };
+            let coerced = match (&old, v) {
+                (Value::Bool(_), Value::Number(n)) => Value::Bool(n.as_f64().is_some_and(|x| x != 0.0)),
+                (Value::Bool(_), Value::String(t)) => Value::Bool(matches!(t.to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes")),
+                (Value::Number(_), Value::String(t)) => match t.trim().parse::<f64>() {
+                    Ok(x) => serde_json::json!(x),
+                    Err(_) => v.clone(),
+                },
+                (Value::Number(_), Value::Bool(b)) => serde_json::json!(u8::from(*b)),
+                (Value::String(_), Value::Number(n)) => Value::String(n.to_string()),
+                (Value::Object(_), Value::Number(n)) => {
+                    let c = n.as_i64().and_then(|i| i16::try_from(i).ok()).map(Color::from_aci);
+                    c.and_then(|c| serde_json::to_value(c).ok()).unwrap_or_else(|| v.clone())
+                }
+                (Value::Object(_), Value::String(t)) => Color::parse(t).and_then(|c| serde_json::to_value(c).ok()).unwrap_or_else(|| v.clone()),
+                _ => v.clone(),
+            };
+            // Integers stored in u8 fields: round floats.
+            let coerced = match (&old, &coerced) {
+                (Value::Number(o), Value::Number(n)) if o.is_u64() && !n.is_u64() => {
+                    serde_json::json!(n.as_f64().filter(|x| x.is_finite()).unwrap_or(0.0).round().clamp(0.0, 255.0) as u64)
+                }
+                _ => coerced,
+            };
+            obj.insert(field.to_string(), coerced);
+            match serde_json::from_value::<DimStyle>(cur.clone()) {
+                Ok(ns) => *self = ns,
+                Err(_) => {
+                    rejected.push(k.clone());
+                    if let Some(o) = cur.as_object_mut() {
+                        o.insert(field.to_string(), old);
+                    }
+                }
+            }
+        }
+        rejected
+    }
+
+    /// This style with a dimension's overrides applied.
+    pub fn with_overrides(&self, o: &serde_json::Map<String, serde_json::Value>) -> DimStyle {
+        let mut st = self.clone();
+        if !o.is_empty() {
+            st.apply_fields(o);
+        }
+        st
+    }
+
     /// The ISO-25 style for metric drawings.
     pub fn iso25() -> Self {
         DimStyle {

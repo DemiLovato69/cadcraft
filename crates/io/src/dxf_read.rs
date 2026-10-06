@@ -262,6 +262,8 @@ fn entity(kind: &str, tags: &[Tag]) -> Option<(Common, EntityKind)> {
                 text_rotation: t.fd(53, 0.0).to_radians(),
                 user_text_pos: t.i(70).unwrap_or(0) & 128 != 0,
                 block: t.s(2).filter(|s| !s.is_empty()),
+                overrides: Default::default(),
+                assoc: Vec::new(),
             })
         }
         "LEADER" => EntityKind::Leader(Leader {

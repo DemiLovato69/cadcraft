@@ -183,3 +183,188 @@ fn hostile_viewports_do_not_panic() {
         let _ = build(&d, &Space::Paper("Layout1".into()), &Options::default());
     }
 }
+
+fn text_doc(style_font: &str, value: &str) -> Drawing {
+    let mut d = Drawing::new_imperial();
+    d.text_styles.push(cadcraft_doc::TextStyle { name: "TT".into(), font: style_font.into(), ..Default::default() });
+    d.add(
+        &Space::Model,
+        Common::default(),
+        EntityKind::Text(cadcraft_doc::Text {
+            insert: Vec3::ZERO,
+            align_pt: None,
+            height: 1.0,
+            value: value.into(),
+            rotation: 0.0,
+            width_factor: 1.0,
+            oblique: 0.0,
+            style: "TT".into(),
+            halign: Default::default(),
+            valign: Default::default(),
+        }),
+    )
+    .unwrap();
+    d
+}
+
+/// The first common system TrueType font, if any is installed (tests skip otherwise).
+fn system_font() -> Option<&'static str> {
+    ["Arial", "Helvetica", "DejaVuSans", "Verdana", "LiberationSans-Regular"].into_iter().find(|n| cadcraft_fonts::ttf::find(n).is_some())
+}
+
+#[test]
+fn truetype_text_is_filled_or_outlined() {
+    let Some(font) = system_font() else { return };
+    let mut d = text_doc(font, "OH");
+    let l = build(&d, &Space::Model, &Options::default());
+    assert!(l.prims.iter().any(|p| p.kind == Kind::Tris), "TEXTFILL=1 fills glyphs");
+    // The O's counter is a hole: filled area is well below the glyph box area.
+    let area: f64 = l
+        .prims
+        .iter()
+        .filter(|p| p.kind == Kind::Tris)
+        .flat_map(|p| l.points(p).chunks(3).map(|t| ((t[1] - t[0]).cross(t[2] - t[0]) / 2.0).abs()).collect::<Vec<_>>())
+        .sum();
+    assert!(area > 0.1 && area < l.bounds.width() * l.bounds.height() * 0.8, "area {area}");
+    assert!((l.bounds.max.y - 1.0).abs() < 0.1, "cap height = text height");
+    d.header.set_i64("TEXTFILL", 0);
+    let l = build(&d, &Space::Model, &Options::default());
+    assert!(l.prims.iter().all(|p| p.kind == Kind::Polyline), "TEXTFILL=0 outlines");
+    assert!(l.prims.len() >= 3, "O has two contours, H one");
+}
+
+#[test]
+fn missing_font_falls_back_to_stroke() {
+    let d = text_doc("NoSuchFontAnywhere.ttf", "OH");
+    let l = build(&d, &Space::Model, &Options::default());
+    assert!(!l.prims.is_empty() && l.prims.iter().all(|p| p.kind == Kind::Polyline));
+}
+
+#[test]
+fn backwards_and_upside_down_mirror_text() {
+    let mut d = text_doc("CADCraft Stroke", "ABC");
+    let normal = build(&d, &Space::Model, &Options::default()).bounds;
+    assert!(normal.min.x >= -1e-9 && normal.min.y >= -1e-9);
+    d.text_styles.iter_mut().for_each(|s| s.backwards = true);
+    let back = build(&d, &Space::Model, &Options::default()).bounds;
+    assert!(back.max.x <= 1e-9 && (back.width() - normal.width()).abs() < 1e-9, "mirrored to the left");
+    d.text_styles.iter_mut().for_each(|s| {
+        s.backwards = false;
+        s.upside_down = true;
+    });
+    let up = build(&d, &Space::Model, &Options::default()).bounds;
+    assert!(up.max.y <= 1e-9 && up.min.y < -0.9, "mirrored below the baseline");
+}
+
+#[test]
+fn truetype_mtext_and_dimension_text() {
+    let Some(font) = system_font() else { return };
+    let mut d = Drawing::new_imperial();
+    d.text_styles.iter_mut().for_each(|s| s.font = font.into());
+    d.add(
+        &Space::Model,
+        Common::default(),
+        EntityKind::MText(cadcraft_doc::MText {
+            insert: Vec3::ZERO,
+            height: 1.0,
+            width: 0.0,
+            attach: 1,
+            rotation: 0.0,
+            style: "Standard".into(),
+            contents: "A{\\C1;B}\\P\\S1/2;".into(),
+            line_spacing: 1.0,
+        }),
+    )
+    .unwrap();
+    let l = build(&d, &Space::Model, &Options::default());
+    assert!(l.prims.iter().any(|p| p.kind == Kind::Tris && p.color == Rgb(255, 0, 0)), "red B");
+    assert!(l.prims.iter().any(|p| p.kind == Kind::Tris && p.color != Rgb(255, 0, 0)));
+    let mut d = Drawing::new_imperial();
+    d.text_styles.iter_mut().for_each(|s| s.font = font.into());
+    d.add(&Space::Model, Common::default(), EntityKind::Dimension(lin_dim())).unwrap();
+    let l = build(&d, &Space::Model, &Options::default());
+    assert!(l.prims.iter().filter(|p| p.kind == Kind::Tris).count() > 2, "arrows plus filled glyphs");
+}
+
+fn lin_dim() -> cadcraft_doc::Dimension {
+    cadcraft_doc::Dimension {
+        kind: cadcraft_doc::DimKind::Linear { rotation: 0.0 },
+        defpt: Vec3::new(0.0, 2.0, 0.0),
+        text_mid: Vec3::ZERO,
+        p13: Vec3::ZERO,
+        p14: Vec3::new(10.0, 0.0, 0.0),
+        p15: Vec3::ZERO,
+        p16: Vec3::ZERO,
+        text: String::new(),
+        style: "Standard".into(),
+        measurement: 0.0,
+        text_rotation: 0.0,
+        user_text_pos: false,
+        block: None,
+        overrides: Default::default(),
+        assoc: Vec::new(),
+    }
+}
+
+#[test]
+fn dimension_colours_by_role() {
+    let mut d = Drawing::new_imperial();
+    if let Some(st) = d.dim_styles.first_mut() {
+        st.dim_line_color = Color::Index(1);
+        st.ext_line_color = Color::Index(3);
+        st.text_color = Color::Index(5);
+    }
+    d.add(&Space::Model, Common::default(), EntityKind::Dimension(lin_dim())).unwrap();
+    let l = build(&d, &Space::Model, &Options::default());
+    let has = |c: Rgb, k: Kind| l.prims.iter().any(|p| p.color == c && p.kind == k);
+    assert!(has(Rgb(255, 0, 0), Kind::Polyline) && has(Rgb(255, 0, 0), Kind::Tris), "dimension line and arrows red");
+    assert!(has(Rgb(0, 255, 0), Kind::Polyline), "extension lines green");
+    assert!(has(Rgb(0, 0, 255), Kind::Polyline), "text blue");
+    // ByBlock (the default) takes the dimension's own colour.
+    let mut d = Drawing::new_imperial();
+    d.add(&Space::Model, Common { color: Color::Index(6), ..Default::default() }, EntityKind::Dimension(lin_dim())).unwrap();
+    let l = build(&d, &Space::Model, &Options::default());
+    assert!(l.prims.iter().all(|p| p.color == Rgb(255, 0, 255)));
+}
+
+#[test]
+fn table_title_is_centred_and_merged() {
+    let mut d = Drawing::new_imperial();
+    let cell = |t: &str| cadcraft_doc::TableCell { text: t.into(), merged: None };
+    let mut title = vec![cell("TITLE"), cell(""), cell("")];
+    title[0].merged = Some((1, 3));
+    let t = cadcraft_doc::Table {
+        insert: Vec3::new(0.0, 0.0, 0.0),
+        col_widths: vec![2.0, 2.0, 2.0],
+        row_heights: vec![1.0, 1.0],
+        cells: vec![title, vec![cell("a"), cell("b"), cell("c")]],
+        style: "Standard".into(),
+        text_height: 0.2,
+        title: true,
+        header: false,
+    };
+    d.add(&Space::Model, Common::default(), EntityKind::Table(t)).unwrap();
+    let l = build(&d, &Space::Model, &Options::default());
+    // No vertical cell borders cross the merged title row (y in 0..-1) except the outer ones.
+    let inner_vertical_in_title = l.prims.iter().filter(|p| p.kind == Kind::Polyline).any(|p| {
+        l.points(p).windows(2).any(|w| {
+            (w[0].x - w[1].x).abs() < 1e-12
+                && (w[0].y - w[1].y).abs() > 0.5
+                && w[0].x > 0.1
+                && w[0].x < 5.9
+                && w[0].y.max(w[1].y) > -0.99
+                && w[0].y.min(w[1].y) < -0.01
+        })
+    });
+    assert!(!inner_vertical_in_title);
+    // Title text centred on the table width.
+    let text: Vec<Vec2> = l
+        .prims
+        .iter()
+        .filter(|p| p.kind == Kind::Polyline)
+        .flat_map(|p| l.points(p).to_vec())
+        .filter(|q| q.y > -0.95 && q.y < -0.05 && q.x > 0.05 && q.x < 5.95)
+        .collect();
+    let b = Bounds2::from_points(text);
+    assert!((b.center().x - 3.0).abs() < 0.05, "{b:?}");
+}
