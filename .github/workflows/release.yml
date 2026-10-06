@@ -1,6 +1,9 @@
 # Release pipeline: every push to `release` builds signed installers for every platform and
 # creates or updates the draft GitHub Release "CADCraft v<version>". See docs/releasing.md.
 #
+# Only the `release` branch builds: pushes to it trigger the run, and a manual dispatch from any
+# other ref is skipped by the guard on the `version` job (every other job needs it). Pushing to
+# `release` is limited by a repository ruleset to org admins and the release-managers team.
 # All jobs run in the `release` environment (restricted to the `release` branch), which holds
 # the signing secrets. Every secret is optional: missing ones produce unsigned artifacts and a
 # warning, never a failed build.
@@ -34,6 +37,7 @@ env:
 jobs:
   version:
     name: version
+    if: github.ref == 'refs/heads/release'
     runs-on: ubuntu-latest
     environment: release
     outputs:
@@ -187,7 +191,6 @@ jobs:
         if: inputs.version != ''
         run: cargo xtask version set "$CADCRAFT_VERSION"
       - name: Build and package (AppImage, deb, rpm, tar.gz)
-        env:
         run: packaging/linux/package.sh
       - name: Check the packages
         run: |
@@ -231,7 +234,6 @@ jobs:
         if: inputs.version != ''
         run: cargo xtask version set "$CADCRAFT_VERSION"
       - name: Build and zip
-        env:
         run: packaging/web/package.sh
       - uses: actions/upload-artifact@v4
         with:
@@ -239,9 +241,53 @@ jobs:
           path: dist/release/*
           if-no-files-found: error
 
+  freebsd:
+    name: FreeBSD x86_64
+    needs: version
+    # GitHub has no FreeBSD runners: build inside a FreeBSD VM on a Linux runner.
+    runs-on: ubuntu-latest
+    environment: release
+    timeout-minutes: 300
+    env:
+      CADCRAFT_VERSION: ${{ needs.version.outputs.version }}
+      CADCRAFT_BUILD_DATE: ${{ needs.version.outputs.date }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and package in a FreeBSD VM
+        uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1
+        with:
+          release: "14.3"
+          usesh: true
+          cpu: 4
+          mem: 12288
+          envs: "CADCRAFT_VERSION CADCRAFT_BUILD_DATE CADCRAFT_BUILD_SHA INPUT_VERSION"
+          copyback: true
+          prepare: |
+            pkg install -y git curl pkgconf cmake python3 libxkbcommon wayland libX11 libXcursor libXrandr libXi libxcb mesa-libs vulkan-loader gtk3 fontconfig freetype2 alsa-lib
+            curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
+          run: |
+            set -e
+            . "$HOME/.cargo/env"
+            git config --global --add safe.directory "*"
+            if [ -n "$INPUT_VERSION" ]; then cargo xtask version set "$CADCRAFT_VERSION"; fi
+            cargo build --release --locked -p cadcraft -p cadcraft-cli
+            name="cadcraft-$CADCRAFT_VERSION-freebsd-x86_64"
+            mkdir -p "dist/release/$name"
+            cp target/release/cadcraft target/release/cadcraft-cli README.md LICENSE-MIT LICENSE-APACHE NOTICE ATTRIBUTION.md "dist/release/$name/"
+            mkdir -p "dist/release/$name/icons"
+            cp -R assets/app-icon/hicolor "dist/release/$name/icons/" 2>/dev/null || true
+            (cd dist/release && tar -czf "$name.tar.gz" "$name" && rm -rf "$name")
+            # Keep the copy back to the runner small.
+            rm -rf target
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-freebsd
+          path: dist/release/*
+          if-no-files-found: error
+
   release:
     name: Draft GitHub Release
-    needs: [version, macos, windows, linux, web]
+    needs: [version, macos, windows, linux, web, freebsd]
     runs-on: ubuntu-latest
     environment: release
     permissions:
