@@ -7,6 +7,7 @@
 //! cadcraft-cli commands [FILTER]                   command catalog (JSON)
 //! cadcraft-cli mcp [--connect HOST:PORT]           MCP server on stdio (headless or bridged to the app)
 //! cadcraft-cli perf [N]                            timing table on a synthetic N-entity drawing
+//! cadcraft-cli sample (bracket|floorplan) OUT       write a built-in sample drawing
 //! ```
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
@@ -22,6 +23,7 @@ const USAGE: &str = "usage:
   cadcraft-cli commands [FILTER]
   cadcraft-cli mcp [--connect HOST:PORT]
   cadcraft-cli perf [N]
+  cadcraft-cli sample (bracket|floorplan) OUT.(dxf|dwg|svg|png)
   cadcraft-cli --version";
 
 fn install_io() {
@@ -47,6 +49,19 @@ fn info(path: &str) -> Result<(), String> {
 fn export(s: &Session, out: &str) -> Result<(), String> {
     let d = s.doc().map_err(|e| e.to_string())?;
     let bytes = cadcraft_io::write(d, out).map_err(|e| e.to_string())?;
+    std::fs::write(out, &bytes).map_err(|e| format!("{out}: {e}"))?;
+    eprintln!("wrote {out} ({} bytes)", bytes.len());
+    Ok(())
+}
+
+fn sample(args: &[String]) -> Result<(), String> {
+    let (Some(which), Some(out)) = (args.first(), args.get(1)) else { return Err(USAGE.into()) };
+    let d = match which.as_str() {
+        "bracket" => cadcraft_engine::sample::bracket(),
+        "floorplan" | "floor" => cadcraft_engine::sample::floor_plan(),
+        other => return Err(format!("unknown sample `{other}` (bracket, floorplan)")),
+    };
+    let bytes = cadcraft_io::write(&d, out).map_err(|e| e.to_string())?;
     std::fs::write(out, &bytes).map_err(|e| format!("{out}: {e}"))?;
     eprintln!("wrote {out} ({} bytes)", bytes.len());
     Ok(())
@@ -264,6 +279,7 @@ fn main() -> ExitCode {
         },
         Some("run") => run(&rest),
         Some("perf") => perf(&rest),
+        Some("sample") => sample(&rest),
         Some("commands") => {
             let s = Session::new();
             let f = rest.first().map(|x| x.to_ascii_lowercase());
