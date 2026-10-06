@@ -306,6 +306,7 @@ fn pdf_layout_one_to_one_with_viewport() {
             id: 2,
             locked: false,
             frozen_layers: Vec::new(),
+            layer_colors: Vec::new(),
         }),
     )
     .unwrap();

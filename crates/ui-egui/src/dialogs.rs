@@ -1,19 +1,21 @@
-//! Dialogs: Layer Properties Manager, Drafting Settings, About, command reference.
+//! Dialogs: Drafting Settings, About, command reference, blocks; dispatches the Layer Properties
+//! Manager ([`crate::layers`]), Quick Select ([`crate::quick`]) and Parameters Manager
+//! ([`crate::parametric`]).
 
-use cadcraft_color::Color;
-use egui::{Color32, RichText, vec2};
-use serde_json::json;
+use egui::{RichText, vec2};
 
 use crate::CadApp;
-use crate::icons::{self, Icon};
 use crate::theme::Tokens;
 
 pub fn show(app: &mut CadApp, ctx: &egui::Context) {
     mtext_editor(app, ctx);
+    crate::quick::quick_properties(app, ctx);
     let Some(d) = app.ui.dialog.clone() else { return };
     let mut open = true;
     match d.as_str() {
-        "layers" => layers(app, ctx, &mut open),
+        "layers" => crate::layers::dialog(app, ctx, &mut open),
+        "qselect" => crate::quick::qselect_dialog(app, ctx, &mut open),
+        "parameters" => crate::parametric::parameters_dialog(app, ctx, &mut open),
         "dsettings" => dsettings(app, ctx, &mut open),
         "about" => about(ctx, &mut open),
         "commands" => commands(app, ctx, &mut open),
@@ -22,86 +24,6 @@ pub fn show(app: &mut CadApp, ctx: &egui::Context) {
     }
     if !open {
         app.ui.dialog = None;
-    }
-}
-
-fn layers(app: &mut CadApp, ctx: &egui::Context, open: &mut bool) {
-    let t = Tokens::get();
-    let mut action: Option<(&str, serde_json::Value)> = None;
-    egui::Window::new("Layer Properties Manager").open(open).default_size(vec2(820.0, 420.0)).resizable(true).show(ctx, |ui| {
-        let Ok(d) = app.session.doc() else { return };
-        let cur = d.header.str("CLAYER", "0");
-        ui.horizontal(|ui| {
-            if icons::button(ui, Icon::LayerProps, 24.0, "New Layer", false).clicked() {
-                let mut n = 1;
-                while d.layer(&format!("Layer{n}")).is_some() {
-                    n += 1;
-                }
-                action = Some(("layer.new", json!({ "name": format!("Layer{n}") })));
-            }
-            if icons::button(ui, Icon::MakeCurrent, 24.0, "Set Current", false).clicked() {
-                // handled per row
-            }
-            ui.label(RichText::new(format!("Current layer: {cur}")).color(t.text_dim));
-        });
-        ui.separator();
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            egui::Grid::new("layers_grid").striped(true).num_columns(9).spacing(vec2(12.0, 4.0)).show(ui, |ui| {
-                for h in ["Status", "Name", "On", "Freeze", "Lock", "Plot", "Color", "Linetype", "Lineweight"] {
-                    ui.label(RichText::new(h).strong());
-                }
-                ui.end_row();
-                for l in &d.layers {
-                    let current = l.name.eq_ignore_ascii_case(&cur);
-                    if ui.selectable_label(current, if current { "✔" } else { " " }).clicked() {
-                        action = Some(("layer.current", json!({ "name": l.name })));
-                    }
-                    ui.label(&l.name);
-                    if icons::button(ui, if l.on { Icon::Bulb } else { Icon::BulbOff }, 18.0, "On/Off", false).clicked() {
-                        action = Some(("layer.set", json!({ "name": l.name, "on": !l.on })));
-                    }
-                    if icons::button(ui, if l.frozen { Icon::Snowflake } else { Icon::Sun }, 18.0, "Freeze", false).clicked() {
-                        action = Some(("layer.set", json!({ "name": l.name, "frozen": !l.frozen })));
-                    }
-                    if icons::button(ui, if l.locked { Icon::Lock } else { Icon::Unlock }, 18.0, "Lock", false).clicked() {
-                        action = Some(("layer.set", json!({ "name": l.name, "locked": !l.locked })));
-                    }
-                    if icons::button(ui, Icon::Plot, 18.0, "Plot", !l.plot).clicked() {
-                        action = Some(("layer.set", json!({ "name": l.name, "plot": !l.plot })));
-                    }
-                    let rgb = l.color.resolve(Color::Index(7), Color::Index(7));
-                    ui.menu_button(RichText::new(format!("■ {}", l.color.name())).color(Color32::from_rgb(rgb.0, rgb.1, rgb.2)), |ui| {
-                        for i in 1..=9u8 {
-                            if ui.button(Color::Index(i).name()).clicked() {
-                                action = Some(("layer.set", json!({ "name": l.name, "color": i })));
-                                ui.close();
-                            }
-                        }
-                    });
-                    ui.menu_button(&l.linetype, |ui| {
-                        for lt in &d.linetypes {
-                            if lt.name.eq_ignore_ascii_case("bylayer") || lt.name.eq_ignore_ascii_case("byblock") {
-                                continue;
-                            }
-                            if ui.button(&lt.name).clicked() {
-                                action = Some(("layer.set", json!({ "name": l.name, "linetype": lt.name })));
-                                ui.close();
-                            }
-                        }
-                        ui.separator();
-                        if ui.button("Load all standard linetypes").clicked() {
-                            action = Some(("linetype", json!({ "load": "*" })));
-                            ui.close();
-                        }
-                    });
-                    ui.label(l.lineweight.name());
-                    ui.end_row();
-                }
-            });
-        });
-    });
-    if let Some((c, p)) = action {
-        let _ = app.run(c, p);
     }
 }
 

@@ -472,6 +472,9 @@ pub struct Viewport {
     pub locked: bool,
     #[serde(default)]
     pub frozen_layers: Vec<String>,
+    /// Per-viewport layer colour overrides (VP Color in the Layer Properties Manager).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layer_colors: Vec<(String, Color)>,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

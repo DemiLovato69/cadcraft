@@ -113,6 +113,7 @@ pub enum Icon {
     Transparency,
     Isodraft,
     DynInput,
+    QuickProps,
     Gear,
     Annotation,
     Workspace,
@@ -848,6 +849,16 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, dim: bool) {
         Concentric => {
             pen.c(12.0, 12.0, 8.0, b);
             pen.c(12.0, 12.0, 4.0, a);
+        }
+        QuickProps => {
+            // A small palette window with property rows and a pointer.
+            pen.rect(3.0, 4.0, 15.0, 13.0, b);
+            pen.l(3.0, 7.0, 18.0, 7.0);
+            for y in [10.0, 13.0] {
+                pen.l(5.0, y, 9.0, y);
+                pen.la(11.0, y, 16.0, y);
+            }
+            pen.poly(&[(15.0, 14.0), (15.0, 22.0), (17.0, 20.0), (19.5, 22.5), (20.5, 21.5), (18.0, 19.0), (21.0, 18.5)], true, b);
         }
         Equal => {
             pen.l(5.0, 9.0, 19.0, 9.0);

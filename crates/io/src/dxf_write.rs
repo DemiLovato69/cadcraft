@@ -715,7 +715,7 @@ pub fn write(d: &Drawing) -> String {
     for l in &d.layers {
         record_head(&mut w, "LAYER", &th, "AcDbLayerTableRecord");
         w.s(2, &l.name);
-        w.i(70, i64::from(l.frozen) | if l.locked { 4 } else { 0 });
+        w.i(70, i64::from(l.frozen) | if l.vp_freeze_new { 2 } else { 0 } | if l.locked { 4 } else { 0 });
         let aci = match l.color {
             Color::True(rgb) => i64::from(cadcraft_color::nearest_aci(rgb)),
             c => i64::from(c.to_aci()).clamp(1, 255),

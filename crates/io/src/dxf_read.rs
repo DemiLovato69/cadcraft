@@ -288,6 +288,7 @@ fn entity(kind: &str, tags: &[Tag]) -> Option<(Common, EntityKind)> {
             id: t.i(69).unwrap_or(0) as u32,
             locked: t.i(90).unwrap_or(0) & 16384 != 0,
             frozen_layers: Vec::new(),
+            layer_colors: Vec::new(),
         }),
         "WIPEOUT" => {
             let o = t.p(10);
@@ -590,6 +591,7 @@ fn tables(tags: &[Tag], d: &mut Drawing, block_records: &mut HashMap<String, Str
                     on: aci >= 0,
                     frozen: flags & 1 != 0,
                     locked: flags & 4 != 0,
+                    vp_freeze_new: flags & 2 != 0,
                     plot: t.i(290).unwrap_or(1) != 0,
                     ..Layer::default()
                 };
