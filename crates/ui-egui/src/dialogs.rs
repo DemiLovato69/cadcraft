@@ -9,6 +9,7 @@ use crate::icons::{self, Icon};
 use crate::theme::Tokens;
 
 pub fn show(app: &mut CadApp, ctx: &egui::Context) {
+    mtext_editor(app, ctx);
     let Some(d) = app.ui.dialog.clone() else { return };
     let mut open = true;
     match d.as_str() {
@@ -225,4 +226,62 @@ fn blocks(app: &mut CadApp, ctx: &egui::Context, open: &mut bool) {
             ui.label(n);
         }
     });
+}
+
+/// The multiline text editor shown while MTEXT asks for its contents.
+fn mtext_editor(app: &mut CadApp, ctx: &egui::Context) {
+    let active = app.session.running.as_ref().is_some_and(|r| r.id == "mtext") && app.session.current_prompt().is_some_and(|p| p.accept.text && !p.accept.point);
+    let id = egui::Id::new("mtext_editor_buffer");
+    if !active {
+        ctx.data_mut(|d| d.remove::<String>(id));
+        return;
+    }
+    let mut buf = ctx.data_mut(|d| d.get_temp::<String>(id)).unwrap_or_default();
+    let mut submit = None;
+    let mut cancel = false;
+    egui::Window::new("Text Editor").collapsible(false).resizable(true).default_size(vec2(460.0, 220.0)).show(ctx, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Style: Standard");
+            ui.separator();
+            let h = app.session.doc().map(|d| d.header.f64("TEXTSIZE", 0.2)).unwrap_or(0.2);
+            ui.label(format!("Height: {h:.4}"));
+            ui.separator();
+            if ui.button("B").on_hover_text("Bold").clicked() {
+                buf.push_str("{\\fArial|b1;}");
+            }
+            if ui.button("⅟").on_hover_text("Stack (type 1/2 then select)").clicked() {
+                buf.push_str("\\S1/2;");
+            }
+            if ui.button("°").on_hover_text("Degree").clicked() {
+                buf.push_str("%%d");
+            }
+            if ui.button("±").on_hover_text("Plus/minus").clicked() {
+                buf.push_str("%%p");
+            }
+            if ui.button("⌀").on_hover_text("Diameter").clicked() {
+                buf.push_str("%%c");
+            }
+        });
+        let r = ui.add(egui::TextEdit::multiline(&mut buf).desired_rows(6).desired_width(f32::INFINITY).hint_text("Type text; Enter starts a new paragraph"));
+        if !r.has_focus() && buf.is_empty() {
+            r.request_focus();
+        }
+        ui.horizontal(|ui| {
+            if ui.button("OK").clicked() || (r.has_focus() && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Enter))) {
+                submit = Some(buf.replace('\n', "\\P"));
+            }
+            if ui.button("Cancel").clicked() {
+                cancel = true;
+            }
+            ui.label(RichText::new("⌘↩ to finish").small());
+        });
+    });
+    ctx.data_mut(|d| d.insert_temp(id, buf));
+    if let Some(t) = submit {
+        ctx.data_mut(|d| d.remove::<String>(id));
+        let _ = app.session.input(cadcraft_engine::Input::Text(t));
+    } else if cancel {
+        ctx.data_mut(|d| d.remove::<String>(id));
+        app.session.cancel();
+    }
 }
