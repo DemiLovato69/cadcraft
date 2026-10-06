@@ -25,6 +25,8 @@ pub struct Layer {
     pub transparency: u8,
     pub description: String,
     pub plot_style: String,
+    /// Frozen in viewports created from now on (New VP Freeze; DXF layer flag 2).
+    pub vp_freeze_new: bool,
 }
 
 impl Default for Layer {
@@ -41,6 +43,7 @@ impl Default for Layer {
             transparency: 0,
             description: String::new(),
             plot_style: "Normal".into(),
+            vp_freeze_new: false,
         }
     }
 }

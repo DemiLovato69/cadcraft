@@ -30,10 +30,6 @@ pub fn specs() -> Vec<CommandSpec> {
             .params("{handles: [hex]} | {window: [[x,y],[x,y]], crossing?: bool} | {at: [x,y]} | {clear: true} | {add?: bool}")
             .noundo()
             .interactive(|_| Ok(Box::new(SelectM::default()))),
-        CommandSpec::new("qselect", "Quick Select...", run_qselect)
-            .menu(&["Edit", "Quick Select..."])
-            .params("{type?: \"Line\"|..., layer?, color?}")
-            .noundo(),
     ]
 }
 
@@ -182,28 +178,6 @@ fn run_select(s: &mut Session, p: &Value) -> Result<Value> {
     s.set_selection(sel);
     let sel = s.selection();
     Ok(json!({ "selected": sel.len(), "handles": sel.iter().map(|h| h.hex()).collect::<Vec<_>>() }))
-}
-
-fn run_qselect(s: &mut Session, p: &Value) -> Result<Value> {
-    let space = s.space();
-    let d = s.doc()?;
-    let ty = str_param(p, "type").map(str::to_ascii_lowercase);
-    let layer = str_param(p, "layer").map(str::to_ascii_lowercase);
-    let color = str_param(p, "color").and_then(cadcraft_color::Color::parse);
-    let hs: Vec<Handle> = d
-        .space(&space)
-        .map(|st| {
-            st.iter()
-                .filter(|e| ty.as_ref().is_none_or(|t| e.kind.type_name().to_ascii_lowercase() == *t || e.kind.dxf_name().to_ascii_lowercase() == *t))
-                .filter(|e| layer.as_ref().is_none_or(|l| e.common.layer.to_ascii_lowercase() == *l))
-                .filter(|e| color.is_none_or(|c| e.common.color == c))
-                .map(|e| e.handle)
-                .collect()
-        })
-        .unwrap_or_default();
-    let n = hs.len();
-    s.set_selection(hs);
-    Ok(json!({ "selected": n, "message": format!("{n} item(s) selected") }))
 }
 
 struct PasteM {

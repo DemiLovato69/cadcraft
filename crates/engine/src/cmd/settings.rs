@@ -65,6 +65,11 @@ pub fn specs() -> Vec<CommandSpec> {
             .params("{on?: bool}")
             .enabled(always)
             .noundo(),
+        CommandSpec::new("qpmode", "Quick Properties", |s, p| toggle(s, p, |st| &mut st.qpmode, "Quick Properties"))
+            .params("{on?: bool}")
+            .enabled(always)
+            .noundo()
+            .transparent(),
         CommandSpec::new("selectioncycling", "Selection Cycling", |s, p| toggle(s, p, |st| &mut st.selection_cycling, "Selection Cycling"))
             .params("{on?: bool}")
             .enabled(always)

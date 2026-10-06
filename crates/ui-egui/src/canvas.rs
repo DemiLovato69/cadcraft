@@ -104,6 +104,8 @@ pub struct CanvasState {
     pub build_ms: f64,
     pub draw_ms: f64,
     hover_at: Option<Pos2>,
+    /// Constraint glyphs for the parametric overlay (cached per drawing revision).
+    pub param: crate::parametric::Cache,
 }
 
 fn color32(c: Rgb) -> Color32 {
@@ -665,6 +667,19 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
         draw_highlight(&painter, &xf, list, &sel, t.selection, 1.5, true);
     }
     app.canvas.draw_ms = crate::now_ms() - t0;
+    // Constraint bars and dynamic dimensional constraints (model space, or inside a viewport).
+    if sheet.is_none() || active_vp.is_some() {
+        let clip = match &active_vp {
+            Some(vp) => Rect::from_two_pos(
+                xf_paper.to_screen(Vec2::new(vp.center.x - vp.width / 2.0, vp.center.y + vp.height / 2.0)),
+                xf_paper.to_screen(Vec2::new(vp.center.x + vp.width / 2.0, vp.center.y - vp.height / 2.0)),
+            )
+            .intersect(rect),
+            None => rect,
+        };
+        let p = painter.with_clip_rect(clip);
+        crate::parametric::draw_overlay(app, ui, &p, &xf);
+    }
     // Grips on selected objects (when idle).
     if app.session.running.is_none()
         && let Ok(st) = app.session.state()

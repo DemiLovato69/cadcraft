@@ -12,7 +12,7 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("layer", "Layers", run_list).menu(&["Format", "Layers"]).alias(&["la", "layers"]).noundo(),
         CommandSpec::new("layer.new", "New Layer", run_new).params("{name, color?, linetype?, lineweight? (mm), current?: bool}"),
         CommandSpec::new("layer.set", "Set Layer Properties", run_set)
-            .params("{name, on?, frozen?, locked?, plot?, color?, linetype?, lineweight?, transparency?, description?, newName?}"),
+            .params("{name, on?, frozen?, locked?, plot?, color?, linetype?, lineweight?, transparency?, description?, newVpFreeze?, newName?}"),
         CommandSpec::new("layer.current", "Make Current", run_current)
             .menu(&["Format", "Layer Tools", "Make Current"])
             .alias(&["clayer"])
@@ -42,6 +42,9 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("layerp", "Previous Layer", run_layerp).menu(&["Format", "Layer Tools", "Previous Layer"]),
         CommandSpec::new("layerstate.save", "Save Layer State", run_state_save).menu(&["Format", "Layer States Manager..."]).params("{name}"),
         CommandSpec::new("layerstate.restore", "Restore Layer State", run_state_restore).params("{name}"),
+        CommandSpec::new("layerstate.list", "List Layer States", run_state_list).params("{} → states").noundo(),
+        CommandSpec::new("layerstate.delete", "Delete Layer State", run_state_delete).params("{name}"),
+        CommandSpec::new("layerstate.rename", "Rename Layer State", run_state_rename).params("{from, to}"),
     ]
 }
 
@@ -50,14 +53,38 @@ fn layer_json(l: &Layer, current: bool) -> Value {
         "name": l.name, "on": l.on, "frozen": l.frozen, "locked": l.locked, "plot": l.plot,
         "color": l.color.name(), "colorRgb": l.color.resolve(Color::Index(7), Color::Index(7)).hex(),
         "linetype": l.linetype, "lineweight": l.lineweight.name(), "transparency": l.transparency,
-        "description": l.description, "current": current,
+        "description": l.description, "current": current, "newVpFreeze": l.vp_freeze_new,
     })
 }
 
 fn run_list(s: &mut Session, _p: &Value) -> Result<Value> {
     let d = s.doc()?;
     let cur = d.header.str("CLAYER", "0");
-    Ok(json!({ "layers": d.layers.iter().map(|l| layer_json(l, l.name.eq_ignore_ascii_case(&cur))).collect::<Vec<_>>() }))
+    let used = used_layers(d);
+    let layers: Vec<Value> = d
+        .layers
+        .iter()
+        .map(|l| {
+            let mut v = layer_json(l, l.name.eq_ignore_ascii_case(&cur));
+            if let Some(o) = v.as_object_mut() {
+                o.insert("used".into(), json!(used.contains(&l.name.to_ascii_lowercase())));
+            }
+            v
+        })
+        .collect();
+    Ok(json!({ "layers": layers, "states": d.layer_states.iter().map(|st| st.name.clone()).collect::<Vec<_>>() }))
+}
+
+/// Lower-case names of layers that have objects on them (model, layouts and block definitions).
+pub fn used_layers(d: &cadcraft_doc::Drawing) -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
+    let ents = d.model.iter().chain(d.layouts.iter().flat_map(|l| l.entities.iter())).chain(d.blocks.values().flat_map(|b| b.entities.iter()));
+    for e in ents.take(5_000_000) {
+        if !set.contains(&e.common.layer.to_ascii_lowercase()) {
+            set.insert(e.common.layer.to_ascii_lowercase());
+        }
+    }
+    set
 }
 
 fn parse_lw(v: &Value) -> Option<Lineweight> {
@@ -104,6 +131,9 @@ fn apply(l: &mut Layer, p: &Value) -> Result<()> {
     }
     if let Some(t) = p.get("transparency").and_then(Value::as_u64) {
         l.transparency = t.min(90) as u8;
+    }
+    if let Some(v) = p.get("newVpFreeze").and_then(Value::as_bool) {
+        l.vp_freeze_new = v;
     }
     if let Some(d) = str_param(p, "description") {
         l.description = d.to_string();
@@ -312,4 +342,70 @@ fn run_state_restore(s: &mut Session, p: &Value) -> Result<Value> {
         }
     }
     ok()
+}
+
+fn run_state_list(s: &mut Session, _p: &Value) -> Result<Value> {
+    let d = s.doc()?;
+    let states: Vec<Value> = d.layer_states.iter().map(|st| json!({ "name": st.name, "layers": st.layers.len() })).collect();
+    let msg = if states.is_empty() {
+        "No saved layer states.".to_string()
+    } else {
+        d.layer_states.iter().map(|st| st.name.clone()).collect::<Vec<_>>().join(", ")
+    };
+    Ok(json!({ "states": states, "message": msg }))
+}
+
+fn run_state_delete(s: &mut Session, p: &Value) -> Result<Value> {
+    let name = str_param(p, "name").ok_or_else(|| bad("layerstate.delete", "`name` is required"))?;
+    let d = s.doc_mut()?;
+    if !d.layer_states.iter().any(|st| st.name == name) {
+        return Err(bad("layerstate.delete", "no such layer state"));
+    }
+    d.layer_states.retain(|st| st.name != name);
+    ok()
+}
+
+fn run_state_rename(s: &mut Session, p: &Value) -> Result<Value> {
+    let from = str_param(p, "from").ok_or_else(|| bad("layerstate.rename", "`from` is required"))?;
+    let to = str_param(p, "to").map(str::trim).ok_or_else(|| bad("layerstate.rename", "`to` is required"))?.to_string();
+    if !valid_name(&to) {
+        return Err(bad("layerstate.rename", "invalid name"));
+    }
+    let d = s.doc_mut()?;
+    if d.layer_states.iter().any(|st| st.name == to) {
+        return Err(bad("layerstate.rename", format!("layer state `{to}` already exists")));
+    }
+    let st = d.layer_states.iter_mut().find(|st| st.name == from).ok_or_else(|| bad("layerstate.rename", "no such layer state"))?;
+    st.name = to;
+    ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use crate::Session;
+
+    #[test]
+    fn layer_states_save_list_restore_delete() {
+        let mut s = Session::new();
+        s.execute("layer.new", &json!({ "name": "A", "color": 1 })).unwrap();
+        s.execute("layerstate.save", &json!({ "name": "base" })).unwrap();
+        s.execute("layer.set", &json!({ "name": "A", "on": false, "color": 3 })).unwrap();
+        let l = s.execute("layerstate.list", &json!({})).unwrap();
+        assert_eq!(l["states"][0]["name"], "base");
+        s.execute("layerstate.restore", &json!({ "name": "base" })).unwrap();
+        let a = s.doc().unwrap().layer("A").unwrap().clone();
+        assert!(a.on);
+        assert_eq!(a.color, cadcraft_color::Color::Index(1));
+        s.execute("layerstate.rename", &json!({ "from": "base", "to": "start" })).unwrap();
+        assert!(s.execute("layerstate.delete", &json!({ "name": "base" })).is_err());
+        s.execute("layerstate.delete", &json!({ "name": "start" })).unwrap();
+        assert!(s.execute("layerstate.list", &json!({})).unwrap()["states"].as_array().unwrap().is_empty());
+        // `used` flags in the layer list.
+        s.execute("line", &json!({ "points": [[0, 0], [1, 1]] })).unwrap();
+        let v = s.execute("layer", &json!({})).unwrap();
+        let used: Vec<bool> = v["layers"].as_array().unwrap().iter().map(|l| l["used"].as_bool().unwrap()).collect();
+        assert!(used.contains(&true) && used.contains(&false));
+    }
 }

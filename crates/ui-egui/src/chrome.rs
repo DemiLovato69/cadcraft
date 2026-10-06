@@ -246,6 +246,7 @@ pub fn status_bar(app: &mut CadApp, ui: &mut egui::Ui) {
             (Icon::Lineweight, s.lwdisplay, "lwdisplay", "Show/Hide Lineweight"),
             (Icon::Transparency, s.transparency_display, "transparencydisplay", "Show/Hide Transparency"),
             (Icon::DynInput, s.dynmode, "dynmode", "Dynamic Input (F12)"),
+            (Icon::QuickProps, s.qpmode, "qpmode", "Quick Properties"),
             (Icon::Annotation, s.annoallvisible, "ui.noop", "Annotation Visibility"),
             (Icon::Workspace, false, "ui.noop", "Workspace Switching"),
             (Icon::Gear, false, "ui.dialog.dsettings", "Drafting Settings"),

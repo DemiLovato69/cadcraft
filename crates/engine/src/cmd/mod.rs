@@ -16,6 +16,7 @@ mod layout;
 mod modify;
 mod modify2;
 mod props;
+mod qselect;
 mod settings;
 mod table;
 mod utility;
@@ -148,6 +149,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         let mut v = Vec::new();
         v.extend(file::specs());
         v.extend(edit::specs());
+        v.extend(qselect::specs());
         v.extend(view::specs());
         v.extend(draw::specs());
         v.extend(draw2::specs());

@@ -16,6 +16,7 @@ const SESSION_VARS: &[&str] = &[
     "GRIDMAJOR",
     "DYNMODE",
     "LWDISPLAY",
+    "QPMODE",
     "PICKBOX",
     "APERTURE",
     "PICKFIRST",
@@ -40,6 +41,7 @@ pub fn get(s: &Session, name: &str) -> Option<Value> {
         "GRIDMAJOR" => json!(st.gridmajor),
         "DYNMODE" => json!(i32::from(st.dynmode)),
         "LWDISPLAY" => json!(i32::from(st.lwdisplay)),
+        "QPMODE" => json!(i32::from(st.qpmode)),
         "PICKBOX" => json!(st.pickbox),
         "APERTURE" => json!(st.aperture),
         "PICKFIRST" => json!(i32::from(st.pickfirst)),
@@ -80,6 +82,10 @@ pub fn get(s: &Session, name: &str) -> Option<Value> {
 fn as_bool(v: &Value) -> Option<bool> {
     v.as_bool().or_else(|| v.as_i64().map(|i| i != 0)).or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()).map(|i| i != 0))
 }
+/// QPMODE is -1/0 (off), 1 or 2 (on) in AutoCAD; booleans work too.
+fn as_i(v: &Value) -> Option<i64> {
+    v.as_i64().or_else(|| v.as_bool().map(i64::from)).or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+}
 fn as_f64(v: &Value) -> Option<f64> {
     v.as_f64().or_else(|| v.as_str().and_then(crate::units::parse_distance)).filter(|f| f.is_finite())
 }
@@ -103,6 +109,7 @@ pub fn set(s: &mut Session, name: &str, v: &Value) -> Result<()> {
         "GRIDMAJOR" => st.gridmajor = as_f64(v).ok_or_else(bad)?.clamp(1.0, 100.0) as u32,
         "DYNMODE" => st.dynmode = as_bool(v).ok_or_else(bad)?,
         "LWDISPLAY" => st.lwdisplay = as_bool(v).ok_or_else(bad)?,
+        "QPMODE" => st.qpmode = as_i(v).ok_or_else(bad)? > 0,
         "PICKBOX" => st.pickbox = as_f64(v).ok_or_else(bad)?.clamp(0.0, 50.0),
         "APERTURE" => st.aperture = as_f64(v).ok_or_else(bad)?.clamp(1.0, 50.0),
         "PICKFIRST" => st.pickfirst = as_bool(v).ok_or_else(bad)?,

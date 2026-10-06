@@ -16,8 +16,11 @@ pub mod control;
 pub mod dialogs;
 pub mod gpu;
 pub mod icons;
+pub mod layers;
 pub mod menus;
 pub mod palettes;
+pub mod parametric;
+pub mod quick;
 pub mod theme;
 
 use std::sync::mpsc::Receiver;

@@ -236,6 +236,8 @@ pub struct Settings {
     pub isodraft: bool,
     pub annoallvisible: bool,
     pub annoautoscale: bool,
+    /// QPMODE: show the Quick Properties palette when objects are selected.
+    pub qpmode: bool,
 }
 
 impl Default for Settings {
@@ -264,6 +266,7 @@ impl Default for Settings {
             isodraft: false,
             annoallvisible: true,
             annoautoscale: false,
+            qpmode: false,
         }
     }
 }

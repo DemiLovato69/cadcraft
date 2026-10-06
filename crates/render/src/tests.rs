@@ -124,7 +124,17 @@ fn layout_with_viewport(vp: cadcraft_doc::Viewport) -> Drawing {
 }
 
 fn vp(center: Vec2, w: f64, h: f64, view_center: Vec2, view_height: f64, id: u32) -> cadcraft_doc::Viewport {
-    cadcraft_doc::Viewport { center: center.to3(0.0), width: w, height: h, view_center, view_height, id, locked: false, frozen_layers: Vec::new() }
+    cadcraft_doc::Viewport {
+        center: center.to3(0.0),
+        width: w,
+        height: h,
+        view_center,
+        view_height,
+        id,
+        locked: false,
+        frozen_layers: Vec::new(),
+        layer_colors: Vec::new(),
+    }
 }
 
 #[test]

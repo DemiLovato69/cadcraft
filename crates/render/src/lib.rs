@@ -109,6 +109,18 @@ struct Ctx<'a> {
     top: Handle,
     /// Layers frozen in the viewport being drawn.
     frozen: &'a [String],
+    /// Per-viewport layer colour overrides of the viewport being drawn.
+    vp_colors: &'a [(String, Color)],
+}
+
+impl Ctx<'_> {
+    /// A layer's colour, honouring the viewport's override.
+    fn layer_color(&self, name: &str) -> Option<Color> {
+        if let Some((_, c)) = self.vp_colors.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
+            return Some(*c);
+        }
+        self.d.layer(name).map(|l| l.color)
+    }
 }
 
 struct Builder<'a> {
@@ -189,7 +201,7 @@ pub fn build_plot(d: &Drawing, space: &Space, opts: &Options) -> DisplayList {
     build_space(d, space, opts, true)
 }
 
-fn top_ctx<'a>(d: &'a Drawing, xf: Mat3, top: Handle, frozen: &'a [String]) -> Ctx<'a> {
+fn top_ctx<'a>(d: &'a Drawing, xf: Mat3, top: Handle, frozen: &'a [String], vp_colors: &'a [(String, Color)]) -> Ctx<'a> {
     Ctx {
         d,
         xf,
@@ -200,6 +212,7 @@ fn top_ctx<'a>(d: &'a Drawing, xf: Mat3, top: Handle, frozen: &'a [String]) -> C
         depth: 0,
         top,
         frozen,
+        vp_colors,
     }
 }
 
@@ -219,7 +232,7 @@ fn build_space(d: &Drawing, space: &Space, opts: &Options, plotting: bool) -> Di
                 }
                 continue;
             }
-            entity(&mut b, &top_ctx(d, Mat3::IDENTITY, e.handle, &[]), e);
+            entity(&mut b, &top_ctx(d, Mat3::IDENTITY, e.handle, &[], &[]), e);
         }
     }
     b.list
@@ -235,7 +248,7 @@ fn viewport(b: &mut Builder, d: &Drawing, e: &Entity, vp: &cadcraft_doc::Viewpor
         return;
     }
     // Border (on the viewport's layer; layer off hides only the border).
-    entity(b, &top_ctx(d, Mat3::IDENTITY, e.handle, &[]), e);
+    entity(b, &top_ctx(d, Mat3::IDENTITY, e.handle, &[], &[]), e);
     let center = vp.center.xy();
     let ok = |v: f64| v.is_finite() && v > 0.0;
     if !(ok(vp.width) && ok(vp.height) && ok(vp.view_height) && center.is_finite() && vp.view_center.is_finite()) {
@@ -262,7 +275,7 @@ fn viewport(b: &mut Builder, d: &Drawing, e: &Entity, vp: &cadcraft_doc::Viewpor
         if matches!(me.kind, EntityKind::Viewport(_)) {
             continue;
         }
-        entity(&mut sub, &top_ctx(d, xf, VIEWPORT_CONTENT, &vp.frozen_layers), me);
+        entity(&mut sub, &top_ctx(d, xf, VIEWPORT_CONTENT, &vp.frozen_layers, &vp.layer_colors), me);
     }
     append_clipped(&mut b.list, &sub.list, &rect);
 }
@@ -325,7 +338,7 @@ fn push_raw(dst: &mut DisplayList, p: &DPrim, kind: Kind, pts: &[Vec2]) {
 pub fn build_entities<'a, I: IntoIterator<Item = &'a Entity>>(d: &Drawing, ents: I, opts: &Options) -> DisplayList {
     let mut b = Builder { list: DisplayList::default(), opts, plotting: false };
     for e in ents {
-        entity(&mut b, &top_ctx(d, Mat3::IDENTITY, e.handle, &[]), e);
+        entity(&mut b, &top_ctx(d, Mat3::IDENTITY, e.handle, &[], &[]), e);
     }
     b.list
 }
@@ -338,7 +351,7 @@ fn resolve(ctx: &Ctx, e: &Entity, plotting: bool) -> (Rgb, f32, Option<cadcraft_
     let visible = e.common.visible
         && layer.is_none_or(|l| l.visible() && (!plotting || l.plot))
         && !ctx.frozen.iter().any(|f| f.eq_ignore_ascii_case(layer_name));
-    let layer_color = layer.map(|l| l.color).unwrap_or(Color::Index(7));
+    let layer_color = ctx.layer_color(layer_name).unwrap_or(Color::Index(7));
     let rgb = e.common.color.resolve(layer_color, ctx.block_color);
     let lw = match e.common.lineweight {
         Lineweight::ByLayer => layer.map(|l| l.lineweight).unwrap_or(Lineweight::Default),
@@ -753,7 +766,7 @@ fn sub_ctx<'a>(ctx: &Ctx<'a>, e: &Entity, m: Mat3) -> Ctx<'a> {
     let layer = if e.common.layer == "0" { ctx.block_layer.clone() } else { Some(e.common.layer.clone()) };
     let color = match e.common.color {
         Color::ByBlock => ctx.block_color,
-        Color::ByLayer => ctx.d.layer(layer.as_deref().unwrap_or("0")).map(|l| l.color).unwrap_or(Color::Index(7)),
+        Color::ByLayer => ctx.layer_color(layer.as_deref().unwrap_or("0")).unwrap_or(Color::Index(7)),
         c => c,
     };
     let lw = match e.common.lineweight {
@@ -776,6 +789,7 @@ fn sub_ctx<'a>(ctx: &Ctx<'a>, e: &Entity, m: Mat3) -> Ctx<'a> {
         depth: ctx.depth + 1,
         top: ctx.top,
         frozen: ctx.frozen,
+        vp_colors: ctx.vp_colors,
     }
 }
 

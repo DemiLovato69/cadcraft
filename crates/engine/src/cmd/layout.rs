@@ -49,9 +49,10 @@ pub fn specs() -> Vec<CommandSpec> {
             .params("{p1?, p2?, layout?}")
             .interactive(|_| Ok(Box::new(MviewM::new(4, false)))),
         CommandSpec::new("viewport.set", "Viewport Properties", run_viewport_set).params(
-            "{handle? (default: selected viewports), scale?: paper units per model unit | \"1:50\", viewHeight?, center?: [x,y], locked?, freeze?: [layer], thaw?: [layer]}",
+            "{handle? (default: selected viewports), scale?: paper units per model unit | \"1:50\", viewHeight?, center?: [x,y], locked?, freeze?: [layer], thaw?: [layer], colors?: {layer: color | null}}",
         ),
-        CommandSpec::new("vplayer", "Viewport Layer Freeze", run_viewport_set).params("{handle?, freeze?: [layer], thaw?: [layer]}"),
+        CommandSpec::new("vplayer", "Viewport Layer Freeze", run_viewport_set)
+            .params("{handle?, freeze?: [layer], thaw?: [layer], colors?: {layer: color (\"red\" | 1..255 | \"r,g,b\") | null to clear}}"),
         CommandSpec::new("pagesetup", "Page Setup Manager...", run_pagesetup)
             .menu(&["File", "Page Setup Manager..."])
             .params(
@@ -400,6 +401,8 @@ fn add_viewports(s: &mut Session, space: &Space, rect: Bounds2, count: usize, ar
         .unwrap_or(1)
         .max(1);
     let mut out = Vec::new();
+    // Layers marked "New VP Freeze" start frozen in new viewports.
+    let vp_frozen: Vec<String> = d.layers.iter().filter(|l| l.vp_freeze_new).map(|l| l.name.clone()).collect();
     for r in split(rect, count, arrangement) {
         let (view_center, view_height) = fit_view(d, r.width(), r.height());
         id = id.saturating_add(1);
@@ -411,7 +414,8 @@ fn add_viewports(s: &mut Session, space: &Space, rect: Bounds2, count: usize, ar
             view_height,
             id,
             locked: false,
-            frozen_layers: Vec::new(),
+            frozen_layers: vp_frozen.clone(),
+            layer_colors: Vec::new(),
         };
         out.push(d.add(space, common.clone(), EntityKind::Viewport(vp))?);
     }
@@ -555,14 +559,23 @@ fn viewport_json(h: Handle, v: &Viewport) -> Value {
         "scale": if v.view_height > 0.0 { v.height / v.view_height } else { 0.0 },
         "locked": v.locked,
         "frozenLayers": v.frozen_layers,
+        "layerColors": v.layer_colors.iter().map(|(l, c)| json!({ "layer": l, "color": c.name() })).collect::<Vec<_>>(),
     })
 }
 
 fn run_viewport_set(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "viewport.set";
     let d = s.doc()?;
-    let hs: Vec<Handle> =
+    let mut hs: Vec<Handle> =
         targets(s, p)?.into_iter().filter(|h| d.entity(*h).is_some_and(|e| matches!(&e.kind, EntityKind::Viewport(v) if v.id != 1))).collect();
+    // Inside a viewport (MSPACE) the active viewport is the default.
+    if hs.is_empty()
+        && p.get("handle").is_none()
+        && p.get("handles").is_none()
+        && let Some((h, _)) = s.state()?.active_viewport()
+    {
+        hs.push(h);
+    }
     if hs.is_empty() {
         return Err(bad(cmd, "no viewport given (pass `handle` or select a viewport)"));
     }
@@ -581,6 +594,28 @@ fn run_viewport_set(s: &mut Session, p: &Value) -> Result<Value> {
     let locked = p.get("locked").and_then(Value::as_bool);
     let freeze = layer_list(p, "freeze");
     let thaw = layer_list(p, "thaw");
+    // Per-viewport layer colours: {layer: colour} (null clears the override).
+    let mut colors: Vec<(String, Option<cadcraft_color::Color>)> = Vec::new();
+    if let Some(m) = p.get("colors").and_then(Value::as_object) {
+        for (layer, c) in m.iter().take(10_000) {
+            let col = match c {
+                Value::Null => None,
+                Value::String(t) => Some(cadcraft_color::Color::parse(t).ok_or_else(|| bad(cmd, format!("bad colour for `{layer}`")))?),
+                Value::Number(n) => Some(
+                    n.as_u64()
+                        .and_then(|i| u8::try_from(i).ok())
+                        .filter(|i| *i > 0)
+                        .map(cadcraft_color::Color::Index)
+                        .ok_or_else(|| bad(cmd, "colour index 1..255"))?,
+                ),
+                _ => return Err(bad(cmd, "`colors` values are colours or null")),
+            };
+            if matches!(col, Some(cadcraft_color::Color::ByLayer | cadcraft_color::Color::ByBlock)) {
+                return Err(bad(cmd, "a viewport layer colour must be an index or true colour"));
+            }
+            colors.push((layer.clone(), col));
+        }
+    }
     let changes_view = scale.is_some() || view_height.is_some() || center.is_some();
     let mut out = Vec::new();
     for h in hs {
@@ -610,6 +645,12 @@ fn run_viewport_set(s: &mut Session, p: &Value) -> Result<Value> {
             }
         }
         v.frozen_layers.retain(|x| !thaw.iter().any(|t| t.eq_ignore_ascii_case(x)));
+        for (layer, c) in &colors {
+            v.layer_colors.retain(|(n, _)| !n.eq_ignore_ascii_case(layer));
+            if let Some(c) = c {
+                v.layer_colors.push((layer.clone(), *c));
+            }
+        }
         out.push(viewport_json(h, &v));
         s.doc_mut()?.modify_entity(h, |e| e.kind = EntityKind::Viewport(v)).map_err(|e| bad(cmd, e.to_string()))?;
     }
@@ -859,6 +900,13 @@ mod tests {
         s.execute("vplayer", &json!({"handle": h, "thaw": "walls"})).unwrap();
         let v = viewports(&s, "Layout1");
         assert_eq!(v[0].1.frozen_layers, vec!["0".to_string()]);
+        s.execute("vplayer", &json!({"handle": h, "colors": {"Walls": "red"}})).unwrap();
+        assert!(s.execute("vplayer", &json!({"handle": h, "colors": {"Walls": "bylayer"}})).is_err());
+        assert!(s.execute("vplayer", &json!({"handle": h, "colors": {"Walls": [1]}})).is_err());
+        let vv = viewports(&s, "Layout1");
+        assert_eq!(vv[0].1.layer_colors, vec![("Walls".to_string(), cadcraft_color::Color::Index(1))]);
+        s.execute("vplayer", &json!({"handle": h, "colors": {"walls": null}})).unwrap();
+        assert!(viewports(&s, "Layout1")[0].1.layer_colors.is_empty());
         assert!((v[0].1.view_height - 30.0).abs() < 1e-9);
         // Layer 0 frozen in the viewport: nothing of the model shows.
         let list = cadcraft_render::build(s.doc().unwrap(), &Space::Paper("Layout1".into()), &cadcraft_render::Options::default());

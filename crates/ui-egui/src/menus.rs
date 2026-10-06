@@ -27,6 +27,8 @@ pub const UI_COMMANDS: &[(&str, &str, &[&str], Option<&str>)] = &[
     ("ui.start", "Start", &["Window", "Start"], None),
     ("ui.dialog.layers", "Layer Properties Manager", &["Window", "Layers"], None),
     ("ui.dialog.blocks", "Blocks", &["Window", "Blocks"], None),
+    ("ui.dialog.qselect", "Quick Select...", &[], None),
+    ("ui.dialog.parameters", "Parameters Manager", &["Window", "Parameters Manager"], None),
     ("ui.dialog.dsettings", "Drafting Settings...", &[], None),
     ("ui.dialog.about", "About CADCraft", &["Help", "About CADCraft"], None),
     ("ui.dialog.commands", "Command Reference", &["Help", "CADCraft Help"], Some("F1")),
@@ -118,7 +120,13 @@ pub fn run_ui_command(app: &mut CadApp, id: &str, params: &Value) -> Option<Resu
             app.ui.start_tab = true;
             Ok(Value::Null)
         }
-        "ui.dialog.layers" | "ui.dialog.blocks" | "ui.dialog.dsettings" | "ui.dialog.about" | "ui.dialog.commands" => {
+        "ui.dialog.layers"
+        | "ui.dialog.blocks"
+        | "ui.dialog.dsettings"
+        | "ui.dialog.about"
+        | "ui.dialog.commands"
+        | "ui.dialog.qselect"
+        | "ui.dialog.parameters" => {
             app.ui.dialog = Some(id.trim_start_matches("ui.dialog.").to_string());
             Ok(Value::Null)
         }
@@ -131,8 +139,23 @@ pub fn run_ui_command(app: &mut CadApp, id: &str, params: &Value) -> Option<Resu
             Ok(Value::Null)
         }
         "ui.noop" => Ok(Value::Null),
-        "layer" if params.is_null() => {
+        "layer" | "la" | "layers" if params.is_null() => {
             app.ui.dialog = Some("layers".into());
+            Ok(Value::Null)
+        }
+        // Typed or menu-invoked (no parameters) these open their dialogs; JSON calls run the command.
+        "qselect" | "qs" if params.is_null() => {
+            app.ui.dialog = Some("qselect".into());
+            Ok(Value::Null)
+        }
+        "parameters" | "par" if params.is_null() => {
+            app.ui.dialog = Some("parameters".into());
+            Ok(Value::Null)
+        }
+        "parametersclose" if params.is_null() => {
+            if app.ui.dialog.as_deref() == Some("parameters") {
+                app.ui.dialog = None;
+            }
             Ok(Value::Null)
         }
         _ => return None,

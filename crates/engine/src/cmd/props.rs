@@ -51,7 +51,7 @@ pub fn specs() -> Vec<CommandSpec> {
     ]
 }
 
-fn entity_props(d: &cadcraft_doc::Drawing, e: &cadcraft_doc::Entity) -> Value {
+pub(super) fn entity_props(d: &cadcraft_doc::Drawing, e: &cadcraft_doc::Entity) -> Value {
     let mut v = json!({
         "handle": e.handle.hex(),
         "type": e.kind.type_name(),
@@ -176,6 +176,17 @@ fn run_set(s: &mut Session, p: &Value) -> Result<Value> {
                     }
                     if let Some(v) = p.get("end") {
                         set_xy(&mut l.b, v);
+                    }
+                    // Length / angle keep the start point and move the end point.
+                    let (a, b) = (l.a.xy(), l.b.xy());
+                    let len = num("length").filter(|x| *x > 0.0 && *x < 1e15).unwrap_or_else(|| a.dist(b));
+                    let ang = num("angle").map(f64::to_radians).unwrap_or_else(|| a.angle_to(b));
+                    if num("length").is_some() || num("angle").is_some() {
+                        let e = cadcraft_geom::Vec2::polar(a, len, ang);
+                        if e.is_finite() {
+                            l.b.x = e.x;
+                            l.b.y = e.y;
+                        }
                     }
                 }
                 EntityKind::Circle(c) => {
