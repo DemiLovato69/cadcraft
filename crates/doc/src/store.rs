@@ -194,6 +194,12 @@ impl EntityStore {
     pub fn same_as(&self, other: &EntityStore) -> bool {
         self.len == other.len && self.chunks.len() == other.chunks.len() && self.chunks.iter().zip(&other.chunks).all(|(a, b)| Arc::ptr_eq(a, b))
     }
+    /// The chunks in draw order as (identity key, entities). A key is stable for as long as any
+    /// clone of this store is alive and changes whenever the chunk is edited (copy-on-write), so
+    /// caches holding a clone can reuse per-chunk work.
+    pub fn chunk_slices(&self) -> impl Iterator<Item = (usize, &[Arc<Entity>])> + '_ {
+        self.chunks.iter().map(|c| (Arc::as_ptr(c) as usize, c.items.as_slice()))
+    }
     /// The last entity in draw order (AutoCAD's "Last" selection).
     pub fn last(&self) -> Option<&Arc<Entity>> {
         self.chunks.last().and_then(|c| c.items.last())

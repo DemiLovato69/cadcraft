@@ -25,73 +25,157 @@ pub const MIN_INDEXED: usize = 256;
 /// Indexes kept alive (open drawings × spaces, plus a few undo states).
 const CACHE_SIZE: usize = 4;
 
-type Item = GeomWithData<Rectangle<[f64; 2]>, u32>;
+/// Tree items carry (chunk serial, index within the chunk); draw indices are derived at query
+/// time so inserting or removing entities never invalidates other chunks' items.
+type Item = GeomWithData<Rectangle<[f64; 2]>, (u32, u32)>;
 
-/// An R-tree over one space's entity bounds.
+static NEXT_SERIAL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+/// One store chunk's entities and bounds, shared between successive indexes while unchanged.
+struct ChunkIx {
+    serial: u32,
+    key: usize,
+    ents: Vec<Arc<Entity>>,
+    bounds: Vec<Bounds2>,
+    /// Local indices of xlines and rays (unbounded; always candidates for pick and crossing).
+    infinite: Vec<u32>,
+}
+
+impl ChunkIx {
+    fn build(d: &Drawing, key: usize, items: &[Arc<Entity>]) -> ChunkIx {
+        let mut infinite = Vec::new();
+        let bounds = items
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                if matches!(e.kind, EntityKind::XLine(_) | EntityKind::Ray(_)) {
+                    infinite.push(u32::try_from(i).unwrap_or(u32::MAX));
+                }
+                entity_bounds(d, e, 0)
+            })
+            .collect();
+        let serial = NEXT_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ChunkIx { serial, key, ents: items.to_vec(), bounds, infinite }
+    }
+    fn items(&self) -> impl Iterator<Item = Item> + '_ {
+        self.bounds.iter().enumerate().filter(|(_, b)| !b.is_empty()).map(|(i, b)| {
+            GeomWithData::new(Rectangle::from_corners([b.min.x, b.min.y], [b.max.x, b.max.y]), (self.serial, u32::try_from(i).unwrap_or(u32::MAX)))
+        })
+    }
+}
+
+/// An R-tree over one space's entity bounds. Built incrementally from the previous index: only
+/// store chunks that changed are re-measured and patched into the tree.
 pub struct SpatialIndex {
     store: EntityStore,
     blocks: BTreeMap<String, Arc<Block>>,
     dim_styles: Vec<DimStyle>,
     dimscale: f64,
-    ents: Vec<Arc<Entity>>,
-    bounds: Vec<Bounds2>,
+    /// (draw index of the chunk's first entity, chunk), in draw order.
+    chunks: Vec<(u32, Arc<ChunkIx>)>,
+    /// Chunk serial → draw offset.
+    offsets: std::collections::HashMap<u32, u32>,
     tree: RTree<Item>,
-    /// Draw indices of xlines and rays (unbounded; always candidates for pick and crossing).
+    /// Draw indices of xlines and rays.
     infinite: Vec<u32>,
+    len: usize,
 }
 
 impl SpatialIndex {
     /// Build an index over a store (no caching).
     pub fn build(d: &Drawing, store: &EntityStore) -> SpatialIndex {
-        let mut ents = Vec::with_capacity(store.len());
-        let mut bounds = Vec::with_capacity(store.len());
-        let mut items = Vec::with_capacity(store.len());
-        let mut infinite = Vec::new();
-        for (i, e) in store.iter().enumerate() {
-            let Ok(idx) = u32::try_from(i) else { break };
-            let b = entity_bounds(d, e, 0);
-            if matches!(e.kind, EntityKind::XLine(_) | EntityKind::Ray(_)) {
-                infinite.push(idx);
-            }
-            if !b.is_empty() {
-                items.push(GeomWithData::new(Rectangle::from_corners([b.min.x, b.min.y], [b.max.x, b.max.y]), idx));
-            }
-            ents.push(e.clone());
-            bounds.push(b);
+        Self::build_from(d, store, None)
+    }
+
+    /// Build, reusing `prev` for chunks the two stores share (only when the bounds context —
+    /// blocks, dimension styles, DIMSCALE — is the same).
+    fn build_from(d: &Drawing, store: &EntityStore, prev: Option<&SpatialIndex>) -> SpatialIndex {
+        let prev = prev.filter(|p| p.same_context(d));
+        let old: std::collections::HashMap<usize, Arc<ChunkIx>> =
+            prev.map(|p| p.chunks.iter().map(|(_, c)| (c.key, c.clone())).collect()).unwrap_or_default();
+        let mut chunks = Vec::new();
+        let mut fresh = Vec::new();
+        let mut kept = std::collections::HashSet::new();
+        let mut offset = 0u32;
+        for (key, items) in store.chunk_slices() {
+            let c = match old.get(&key) {
+                Some(c) if c.ents.len() == items.len() => {
+                    kept.insert(c.serial);
+                    c.clone()
+                }
+                _ => {
+                    let c = Arc::new(ChunkIx::build(d, key, items));
+                    fresh.push(c.clone());
+                    c
+                }
+            };
+            let n = u32::try_from(c.ents.len()).unwrap_or(u32::MAX);
+            chunks.push((offset, c));
+            offset = offset.saturating_add(n);
         }
+        // Patch the previous tree when most of it survives; otherwise bulk-load.
+        let tree = match prev {
+            Some(p) if kept.len() * 2 >= chunks.len().max(1) => {
+                let mut tree = p.tree.clone();
+                for (_, c) in p.chunks.iter().filter(|(_, c)| !kept.contains(&c.serial)) {
+                    for it in c.items() {
+                        tree.remove(&it);
+                    }
+                }
+                for c in &fresh {
+                    for it in c.items() {
+                        tree.insert(it);
+                    }
+                }
+                tree
+            }
+            _ => RTree::bulk_load(chunks.iter().flat_map(|(_, c)| c.items()).collect()),
+        };
+        let offsets = chunks.iter().map(|(off, c)| (c.serial, *off)).collect();
+        let infinite = chunks.iter().flat_map(|(off, c)| c.infinite.iter().map(move |i| off + i)).collect();
         SpatialIndex {
             store: store.clone(),
             blocks: d.blocks.clone(),
             dim_styles: d.dim_styles.clone(),
             dimscale: d.header.f64("DIMSCALE", 1.0),
-            ents,
-            bounds,
-            tree: RTree::bulk_load(items),
+            chunks,
+            offsets,
+            tree,
             infinite,
+            len: offset as usize,
         }
     }
 
-    fn matches(&self, d: &Drawing, store: &EntityStore) -> bool {
-        self.store.same_as(store)
-            && self.blocks.len() == d.blocks.len()
+    fn same_context(&self, d: &Drawing) -> bool {
+        self.blocks.len() == d.blocks.len()
             && self.blocks.iter().zip(&d.blocks).all(|((ka, a), (kb, b))| ka == kb && Arc::ptr_eq(a, b))
             && self.dimscale.to_bits() == d.header.f64("DIMSCALE", 1.0).to_bits()
             && self.dim_styles == d.dim_styles
     }
 
+    fn matches(&self, d: &Drawing, store: &EntityStore) -> bool {
+        self.store.same_as(store) && self.same_context(d)
+    }
+
     pub fn len(&self) -> usize {
-        self.ents.len()
+        self.len
     }
     pub fn is_empty(&self) -> bool {
-        self.ents.is_empty()
+        self.len == 0
+    }
+    fn locate(&self, i: u32) -> Option<(&ChunkIx, usize)> {
+        let pos = self.chunks.partition_point(|(off, _)| *off <= i).checked_sub(1)?;
+        let (off, c) = self.chunks.get(pos)?;
+        Some((c, (i - off) as usize))
     }
     /// The entity at draw index `i`.
     pub fn entity(&self, i: u32) -> Option<&Arc<Entity>> {
-        self.ents.get(i as usize)
+        let (c, l) = self.locate(i)?;
+        c.ents.get(l)
     }
     /// The bounds of the entity at draw index `i` (as [`entity_bounds`] computes them).
     pub fn bounds(&self, i: u32) -> Bounds2 {
-        self.bounds.get(i as usize).copied().unwrap_or(Bounds2::EMPTY)
+        self.locate(i).and_then(|(c, l)| c.bounds.get(l).copied()).unwrap_or(Bounds2::EMPTY)
     }
 
     /// Draw indices (ascending) of entities whose bounds touch `b`, optionally with the infinite
@@ -106,7 +190,8 @@ impl SpatialIndex {
         // Pad a little so rounding in the callers' own predicates never loses a candidate.
         let pad = (b.width() + b.height()) * 1e-9 + (b.min.x.abs() + b.min.y.abs() + b.max.x.abs() + b.max.y.abs()) * 1e-12 + 1e-300;
         let env = AABB::from_corners([b.min.x - pad, b.min.y - pad], [b.max.x + pad, b.max.y + pad]);
-        let mut out: Vec<u32> = self.tree.locate_in_envelope_intersecting(&env).map(|it| it.data).collect();
+        let mut out: Vec<u32> =
+            self.tree.locate_in_envelope_intersecting(&env).filter_map(|it| self.offsets.get(&it.data.0).map(|off| off + it.data.1)).collect();
         if with_infinite {
             out.extend_from_slice(&self.infinite);
         }
@@ -138,8 +223,10 @@ pub fn index_store(d: &Drawing, store: &EntityStore) -> Arc<SpatialIndex> {
             return ix;
         }
     }
-    // Build outside the lock so other threads aren't blocked.
-    let ix = Arc::new(SpatialIndex::build(d, store));
+    // The most recent index is the likeliest ancestor of this store (one edit ago): reuse its
+    // unchanged chunks. Build outside the lock so other threads aren't blocked.
+    let prev = CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).last().cloned();
+    let ix = Arc::new(SpatialIndex::build_from(d, store, prev.as_deref()));
     let mut cache = CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     // Drop entries whose store this one supersedes cheaply: keep the most recent ones.
     while cache.len() >= CACHE_SIZE {
@@ -369,5 +456,46 @@ mod tests {
         let d = drawing(1, MIN_INDEXED - 1);
         assert!(index(&d, &Space::Model).is_none());
         assert!(index(&d, &Space::Paper("nope".into())).is_none());
+    }
+
+    #[test]
+    fn incremental_index_matches_fresh_build() {
+        let mut d = drawing(7, 3000);
+        let mut r = Rng(99);
+        let mut prev = SpatialIndex::build(&d, &d.model);
+        for step in 0..60 {
+            let hs = d.model.handles();
+            let h = hs[(r.f() * hs.len() as f64) as usize % hs.len()];
+            match step % 4 {
+                0 => {
+                    d.model.remove(h);
+                }
+                1 => {
+                    let c = v3(r.r(-50.0, 150.0), r.r(-50.0, 150.0));
+                    d.add(&Space::Model, Common::default(), EntityKind::Circle(cadcraft_doc::Circle { center: c, radius: r.r(0.1, 5.0) })).unwrap();
+                }
+                2 => {
+                    d.model.send_to_back(h);
+                }
+                _ => {
+                    let (dx, dy) = (r.r(-20.0, 20.0), r.r(-20.0, 20.0));
+                    d.modify_entity(h, |e| e.kind.transform(&cadcraft_geom::Mat3::translate(Vec2::new(dx, dy)))).unwrap();
+                }
+            }
+            let inc = SpatialIndex::build_from(&d, &d.model, Some(&prev));
+            let fresh = SpatialIndex::build(&d, &d.model);
+            assert_eq!(inc.len(), fresh.len());
+            for _ in 0..20 {
+                let c = Vec2::new(r.r(-50.0, 150.0), r.r(-50.0, 150.0));
+                let w = r.r(0.1, 30.0);
+                let b = Bounds2::new(c, c + Vec2::new(w, w));
+                let (a, f) = (inc.query(&b, true).unwrap(), fresh.query(&b, true).unwrap());
+                assert_eq!(a, f, "step {step}");
+                for i in a {
+                    assert_eq!(inc.entity(i).map(|e| e.handle), fresh.entity(i).map(|e| e.handle));
+                }
+            }
+            prev = inc;
+        }
     }
 }

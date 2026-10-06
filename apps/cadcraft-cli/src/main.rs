@@ -205,6 +205,15 @@ fn perf(args: &[String]) -> Result<(), String> {
     let total = ms(t);
     rows.push(("pick x1000".into(), total, format!("{hits} hits, {:.3} ms/pick", total / 1000.0)));
 
+    // One edit, then a pick: only the touched chunk is re-indexed.
+    let mut edited = d.clone();
+    if let Some(h) = edited.model.last().map(|e| e.handle) {
+        edited.model.modify(h, |e| e.common.layer = "0".into());
+    }
+    let t = Instant::now();
+    let _ = select::pick(&edited, &Space::Model, pts.first().copied().unwrap_or(Vec2::ZERO), ap);
+    rows.push(("pick after one edit (incremental re-index)".into(), ms(t), String::new()));
+
     let mut sel = 0usize;
     let t = Instant::now();
     for k in 0..20 {
