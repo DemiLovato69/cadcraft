@@ -41,8 +41,8 @@
 <br>
 
 <p align="center">
-  <img src="docs/images/ui-bracket.png" alt="CADCraft with a mechanical drawing of a mounting bracket open: a front view with bolt holes, red centre lines, a yellow hidden circle and cyan dimensions, a hatched section view, notes and a title block; the Tool Sets palette is on the left, Layers and Properties on the right and the command line at the bottom is asking for the next point of a LINE" width="100%">
-  <br><sub><b>Mounting bracket</b>: a two-view part drawing with dimensions, centre lines, hidden lines and an ANSI31 section hatch — drawn, dimensioned and rendered by CADCraft.</sub>
+  <img src="docs/images/ui-apartment.png" alt="CADCraft with an apartment floor plan open: hatched grey walls, blue windows, green door swings, furniture outlines, yellow room names with areas, a yellow room schedule table, a multileader note and cyan dimensions with architectural ticks; Tool Sets on the left, Layers and Properties on the right, the command line at the bottom" width="100%">
+  <br><sub><b>Apartment plan</b> (<a href="examples/apartment.dxf">examples/apartment.dxf</a>): walls with pick-point hatching, TrueType MTEXT room labels, a TABLE, a multileader and architectural dimensions — built entirely from CADCraft commands.</sub>
 </p>
 
 > [!NOTE]
@@ -51,6 +51,7 @@
 > last week. If you make things, you're one of us. **[Come say hi on Discord](https://discord.gg/artcraft).**
 
 <p align="center">
+  <a href="#screenshots">Screenshots</a> ·
   <a href="#why-cadcraft">Why CADCraft</a> ·
   <a href="#what-works-today">What works today</a> ·
   <a href="#quick-start">Quick start</a> ·
@@ -60,6 +61,19 @@
   <a href="#the-crafting-apps">The Crafting Apps</a> ·
   <a href="#license-and-credits">License and credits</a>
 </p>
+
+## Screenshots
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/images/ui-layout.png" alt="A paper-space layout in CADCraft: a white sheet with a dashed printable area and a viewport showing the apartment plan at scale, the status bar showing the A1 Plan layout tab and a PAPER toggle"></td>
+    <td width="50%"><img src="docs/images/ui-bracket.png" alt="CADCraft with a mounting bracket part drawing: front view with bolt holes, centre lines and dimensions, a hatched section view, notes and a title block"></td>
+  </tr>
+  <tr>
+    <td><sub><b>Layouts</b>: paper space with viewports, page setups and PLOT to PDF. Double-click a viewport to work in model space through it.</sub></td>
+    <td><sub><b>Mounting bracket</b>: a two-view part drawing with centre lines, hidden lines, an ANSI31 section hatch and a title block.</sub></td>
+  </tr>
+</table>
 
 ## Why CADCraft
 
@@ -90,9 +104,12 @@ numbers):
 | Modify | ERASE, MOVE, COPY, ROTATE, SCALE, MIRROR, STRETCH, OFFSET, TRIM, EXTEND, FILLET, CHAMFER, BREAK, JOIN, EXPLODE, rectangular/polar ARRAY, draw order, OVERKILL |
 | Precision | Object snaps (endpoint, midpoint, center, geometric center, node, quadrant, intersection, insertion, perpendicular, tangent, nearest), polar tracking, ortho, grid snap |
 | Layers & properties | Layers palette and Layer Properties Manager (on/off, freeze, lock, plot, colour, linetype), layer tools (isolate, freeze, off, lock, match, previous), Properties palette with per-object editing, linetypes, lineweights, colour index and true colour |
-| Annotation | Dimensions (linear, aligned, radius, diameter, angular, ordinate, arc length) rendered from DIMSTYLE settings, our own single-stroke drafting font, `%%d %%p %%c` codes, MTEXT wrapping and attachment |
-| Hatch & blocks | Pattern and solid hatches with our own pattern library, block references with attributes and nested blocks |
-| Files | DXF read/write (R12–2018), DWG read/write (R13–2018, via the acadrust library), SVG and PNG export |
+| Annotation | All DIM* commands with full DIMSTYLE variables, overrides and every arrowhead, associative dimensions that follow geometry, MLEADER, TABLE, TrueType fonts, MTEXT formatting codes (fonts, heights, colours, stacked fractions), our own single-stroke drafting font |
+| Hatch & blocks | Pick-point hatch boundaries with islands, pattern, solid and gradient fills from our own pattern library, BLOCK/INSERT, attributes and nested blocks |
+| Files | DXF read/write (R12–2018, including dimension styles, associativity, tables and constraints), DWG read/write (R13–2018, via the acadrust library), PDF plotting, SVG and PNG export |
+| Layouts & plotting | Paper-space layouts, viewports (scale, lock, per-viewport layer freeze), MSPACE/PSPACE through viewports, page setups, PLOT and EXPORTPDF |
+| Parametric | Geometric and dimensional constraints, AUTOCONSTRAIN, PARAMETERS with expressions, conflict detection; constraints re-solve after every edit |
+| Grips | Hot grips with Space to cycle Stretch, Move, Rotate, Scale and Mirror |
 | Automation | MCP server, JSON control channel, `cadcraft-cli` (info, convert, run, commands, mcp) |
 
 ## Quick start

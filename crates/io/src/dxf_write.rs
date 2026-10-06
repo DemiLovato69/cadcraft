@@ -651,6 +651,28 @@ fn entity(w: &mut W, d: &Drawing, e: &Entity, owner: &str, paper: bool, cx: &Ctx
             w.f(1040, t.text_height);
             w.s(1000, &t.style);
         }
+        EntityKind::MLeader(m) => {
+            // Written as plain LEADER + MTEXT entities (MULTILEADER objects aren't supported
+            // yet), so every reader shows the annotation.
+            for arm in m.leaders.iter().take(64) {
+                let mut vertices = arm.clone();
+                vertices.push(m.landing);
+                let le = Entity {
+                    handle: Handle(u64::from_str_radix(&w.h(), 16).unwrap_or(0)),
+                    common: e.common.clone(),
+                    kind: EntityKind::Leader(cadcraft_doc::Leader { vertices, arrow: true, spline: false, style: m.style.clone() }),
+                };
+                entity(w, d, &le, owner, paper, cx);
+            }
+            if let Some(t) = &m.text {
+                let te = Entity {
+                    handle: Handle(u64::from_str_radix(&w.h(), 16).unwrap_or(0)),
+                    common: e.common.clone(),
+                    kind: EntityKind::MText(t.clone()),
+                };
+                entity(w, d, &te, owner, paper, cx);
+            }
+        }
         EntityKind::Leader(l) => {
             w.s(0, "LEADER");
             common(w, e, owner, paper, "AcDbLeader");

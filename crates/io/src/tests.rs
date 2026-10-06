@@ -837,3 +837,30 @@ fn dwg_roundtrip_keeps_extension_data() {
     let r = back.text_style("Romans").unwrap();
     assert!(r.backwards && r.annotative);
 }
+
+#[test]
+fn mleader_is_written_as_leader_and_mtext() {
+    let mut d = Drawing::new_metric();
+    let text = cadcraft_doc::MText {
+        insert: Vec3::new(12.0, 5.0, 0.0),
+        height: 2.5,
+        width: 0.0,
+        attach: 1,
+        rotation: 0.0,
+        contents: "Note".into(),
+        style: "Standard".into(),
+        line_spacing: 1.0,
+    };
+    let m = cadcraft_doc::MLeader {
+        leaders: vec![vec![Vec3::new(0.0, 0.0, 0.0)]],
+        landing: Vec3::new(10.0, 5.0, 0.0),
+        dogleg: 2.0,
+        text: Some(text),
+        style: "Standard".into(),
+        arrow_size: 2.5,
+    };
+    d.add(&Space::Model, Default::default(), EntityKind::MLeader(m)).unwrap();
+    let back = roundtrip(&d);
+    assert!(back.model.iter().any(|e| matches!(e.kind, EntityKind::Leader(_))));
+    assert!(back.model.iter().any(|e| matches!(&e.kind, EntityKind::MText(t) if t.contents == "Note")));
+}
